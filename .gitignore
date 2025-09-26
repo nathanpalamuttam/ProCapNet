@@ -48,3 +48,4 @@ enhancer_promoter_compatibility/
 src/GENCODE_protein_coding/*
 !src/GENCODE_protein_coding/*ipynb
 !src/GENCODE_protein_coding/*py
+/home2/npp8/ProCapNet/wget-log
