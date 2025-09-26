@@ -84,7 +84,17 @@ def split_peaks_and_write_to_files(peaks_filename, fold_num):
 
 if __name__ == "__main__":
     assert len(sys.argv) == 2
-    peaks_filename = sys.argv[1]
+    peaks_arg = sys.argv[1]
+
+    peaks_filename = peaks_arg
+    if not os.path.exists(peaks_filename):
+        # Allow passing a cell type instead of a full path for convenience.
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        proj_root = os.path.dirname(os.path.dirname(script_dir))
+        candidate = os.path.join(proj_root, "data", "procap", "processed", peaks_arg, "peaks.bed.gz")
+        if os.path.exists(candidate):
+            peaks_filename = candidate
+
     assert os.path.exists(peaks_filename), peaks_filename
     assert peaks_filename.endswith(".gz"), peaks_filename
 
