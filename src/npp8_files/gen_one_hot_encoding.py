@@ -10,7 +10,10 @@ for path in (train_src, utils_src):
     if path not in sys.path:
         sys.path.append(path)
 
-from data_loading import extract_sequences
+try:
+    from data_loading import extract_sequences
+except ImportError:  # data_loading may omit legacy helpers in newer loaders
+    extract_sequences = None
 
 
 _REVCOMP_IDX = np.array([3, 2, 1, 0], dtype=np.int64)
