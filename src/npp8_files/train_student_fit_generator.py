@@ -38,7 +38,7 @@ class FitGeneratorDataset(Dataset):
 
         probs = torch.exp(log_probs)
         total_count = torch.exp(log_count).item()
-        targets = probs * total_count
+        targets = torch.round(probs * total_count)
 
         mask = torch.ones_like(targets, dtype=torch.bool)
         return inputs, targets, mask
@@ -61,17 +61,16 @@ def _split_indices(n_examples: int, val_fraction: float, seed: int) -> Tuple[np.
 def _load_validation_arrays(archive_path: Path, indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     with np.load(archive_path, mmap_mode="r") as archive:
         inputs = np.ascontiguousarray(archive["inputs"][indices], dtype=np.float32)
-        log_probs = archive["teacher_log_probs"][indices]
-        log_counts = archive["teacher_log_counts"][indices]
+        targets = archive["teacher_profile_counts"][indices]
 
-    probs = np.empty_like(log_probs)
-    np.exp(log_probs, out=probs)
-
-    total_counts = np.empty_like(log_counts)
-    np.exp(log_counts, out=total_counts)
-
-    targets = probs * total_counts.reshape(-1, 1, 1)
-    return inputs, targets.astype(np.float32, copy=False)
+    targets = np.rint(targets).astype(np.float32, copy=False)
+    totals = targets.reshape(targets.shape[0], -1).sum(axis=1)
+    if np.any(totals == 0):
+        targets = targets.copy()
+        zero_idx = np.where(totals == 0)[0]
+        for idx in zero_idx:
+            targets[idx, :, 0] = 1.0
+    return inputs, targets
 
 
 def make_training_loader(
@@ -112,10 +111,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE, help="Path to the distillation NPZ archive.")
     parser.add_argument("--model-save-path", type=Path, default=DEFAULT_SAVE, help="Destination for the trained model checkpoint.")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--validation-iter", type=int, default=200, help="Validate every N training iterations.")
+    parser.add_argument("--validation-iter", type=int, default=100, help="Validate every N training iterations.")
     parser.add_argument("--early-stop-epochs", type=int, default=10)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--alpha", type=float, default=1.0, help="Weight for the count loss term.")

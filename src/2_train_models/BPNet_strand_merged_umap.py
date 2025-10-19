@@ -198,7 +198,7 @@ class Model(torch.nn.Module):
                 # Extract the losses for logging
                 profile_loss_ = profile_loss.item()
                 count_loss_ = count_loss.item()
-
+                
                 # Mix losses together and update the model
                 loss = profile_loss + self.alpha * count_loss
                 loss.backward()
