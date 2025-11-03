@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Tuple, List
 
 import numpy as np
 import torch
@@ -135,9 +135,11 @@ def make_dataloaders(
     seed: int,
     train_limit: int | None,
     val_limit: int | None,
-) -> Tuple[DataLoader, DataLoader]:
+    base_only: bool,
+) -> Tuple[DataLoader, DataLoader, np.ndarray]:
     archive = np.load(archive_path, mmap_mode="r")
     n_examples = archive["inputs"].shape[0]
+    aug = archive.get("augmentation_id")
     archive.close()
 
     rng = np.random.default_rng(seed)
@@ -150,6 +152,11 @@ def make_dataloaders(
         train_idx = train_idx[:train_limit]
     if val_limit is not None:
         val_idx = val_idx[:val_limit]
+
+    # Optionally keep only base (augmentation_id == 0) samples in validation
+    if base_only and aug is not None:
+        mask = aug[val_idx] == 0
+        val_idx = val_idx[mask]
 
     train_dataset = DistillationDataset(archive_path, train_idx)
     val_dataset = DistillationDataset(archive_path, val_idx)
@@ -168,7 +175,7 @@ def make_dataloaders(
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, val_idx
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -194,6 +201,23 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("ProCapNet/models/distilled_student"),
         help="Directory to store checkpoints and logs.",
+    )
+    parser.add_argument(
+        "--experiment-npz",
+        type=Path,
+        default=None,
+        help="Optional NPZ with experimental profiles aligned to distillation archive for per-epoch eval.",
+    )
+    parser.add_argument(
+        "--eval-base-only",
+        action="store_true",
+        help="When evaluating vs experiment, restrict to augmentation_id == 0 (base examples).",
+    )
+    parser.add_argument(
+        "--exp-plot-path",
+        type=Path,
+        default=None,
+        help="If set, save a PNG of student-vs-experiment validation metrics across epochs.",
     )
     return parser.parse_args(argv)
 
@@ -224,13 +248,14 @@ def main(argv: Iterable[str] | None = None) -> None:
     if not archive_path.exists():
         raise FileNotFoundError(f"Could not find distillation archive at {archive_path}")
 
-    train_loader, val_loader = make_dataloaders(
+    train_loader, val_loader, val_indices = make_dataloaders(
         archive_path,
         batch_size=args.batch_size,
         val_fraction=args.val_fraction,
         seed=args.seed,
         train_limit=args.train_limit,
         val_limit=args.val_limit,
+        base_only=args.eval_base_only,
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -238,9 +263,90 @@ def main(argv: Iterable[str] | None = None) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "training_metrics.jsonl"
 
-    history = []
+    history: List[Dict] = []
     best_val = float("inf")
     best_state = None
+
+    # Optionally map experimental profiles once (memory-mapped)
+    exp_profiles = None
+    exp_totals = None
+    if args.experiment_npz is not None:
+        exp_path = Path(args.experiment_npz).expanduser().resolve()
+        if not exp_path.exists():
+            raise FileNotFoundError(f"Experimental NPZ not found: {exp_path}")
+        exp_archive = np.load(exp_path, mmap_mode="r")
+        exp_profiles = exp_archive["experimental_profile_counts"]
+        exp_totals = exp_profiles.sum(axis=(1, 2))
+
+    def _eval_student_vs_experiment() -> Dict[str, float]:
+        if exp_profiles is None:
+            return {}
+
+        device_local = device
+        model.eval()
+        log_softmax = torch.nn.LogSoftmax(dim=-1)
+
+        prof_corrs: List[float] = []
+        cnt_corrs: List[float] = []
+        cnt_mses: List[float] = []
+
+        offset = 0
+        for batch in val_loader:
+            X = batch["inputs"].to(device_local, non_blocking=True)
+            with torch.no_grad():
+                logits, log_counts = model(X)
+                flat = logits.reshape(logits.shape[0], -1)
+                log_probs = log_softmax(flat).reshape_as(logits)
+                probs = torch.exp(log_probs)
+                total_counts = torch.exp(log_counts) - 1.0
+                pred_profiles = probs * total_counts.reshape(-1, 1, 1)
+
+            bsz = pred_profiles.shape[0]
+            idx_slice = val_indices[offset : offset + bsz]
+            offset += bsz
+
+            true_profiles = exp_profiles[idx_slice]
+
+            # Move predictions to CPU numpy
+            pred_np = pred_profiles.detach().cpu().numpy().astype(np.float32, copy=False)
+
+            # Per-example metrics
+            for i in range(bsz):
+                p = pred_np[i]
+                t = true_profiles[i]
+
+                # Profile Pearson (flattened across strands and positions)
+                x = p.reshape(-1)
+                y = t.reshape(-1)
+                if np.std(x) == 0 or np.std(y) == 0:
+                    prof_corr = np.nan
+                else:
+                    prof_corr = np.corrcoef(x, y)[0, 1]
+                prof_corrs.append(float(prof_corr))
+
+                # Count Pearson across positions (sum across strands)
+                px = p.sum(axis=0)
+                py = t.sum(axis=0)
+                if np.std(px) == 0 or np.std(py) == 0:
+                    cnt_corr = np.nan
+                else:
+                    cnt_corr = np.corrcoef(px, py)[0, 1]
+                cnt_corrs.append(float(cnt_corr))
+
+                # Count log1pMSE on scalar totals
+                tot_p = p.sum()
+                tot_t = t.sum()
+                cnt_mse = float((np.log1p(tot_p) - np.log1p(tot_t)) ** 2)
+                cnt_mses.append(cnt_mse)
+
+        return {
+            "exp_profile_pearson_mean": float(np.nanmean(prof_corrs)) if prof_corrs else float("nan"),
+            "exp_profile_pearson_median": float(np.nanmedian(prof_corrs)) if prof_corrs else float("nan"),
+            "exp_count_pearson_mean": float(np.nanmean(cnt_corrs)) if cnt_corrs else float("nan"),
+            "exp_count_pearson_median": float(np.nanmedian(cnt_corrs)) if cnt_corrs else float("nan"),
+            "exp_count_log1pMSE_mean": float(np.nanmean(cnt_mses)) if cnt_mses else float("nan"),
+            "exp_count_log1pMSE_median": float(np.nanmedian(cnt_mses)) if cnt_mses else float("nan"),
+        }
 
     for epoch in range(1, args.epochs + 1):
         train_total, train_prob, train_count = train_epoch(
@@ -249,7 +355,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         val_total, val_prob, val_count = evaluate(
             model, val_loader, device, args.count_loss_weight
         )
-        record = {
+        record: Dict = {
             "epoch": epoch,
             "train_total": train_total,
             "train_prob": train_prob,
@@ -258,6 +364,11 @@ def main(argv: Iterable[str] | None = None) -> None:
             "val_prob": val_prob,
             "val_count": val_count,
         }
+
+        # Optionally evaluate vs experiment for this epoch
+        if exp_profiles is not None:
+            exp_metrics = _eval_student_vs_experiment()
+            record.update(exp_metrics)
         history.append(record)
         print(
             f"Epoch {epoch:02d}: train_total={train_total:.4f} "
@@ -275,6 +386,34 @@ def main(argv: Iterable[str] | None = None) -> None:
     if best_state is not None:
         torch.save(best_state, args.output_dir / "student_best.pt")
     torch.save(model.state_dict(), args.output_dir / "student_last.pt")
+
+    # Optional plotting of student-vs-experiment metrics across epochs
+    if args.exp_plot_path is not None and args.experiment_npz is not None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib not installed; skipping student-vs-experiment plot")
+        else:
+            exp_plot = Path(args.exp_plot_path).expanduser().resolve()
+            exp_plot.parent.mkdir(parents=True, exist_ok=True)
+
+            epochs = [h["epoch"] for h in history]
+            def series(key: str):
+                return [h.get(key, np.nan) for h in history]
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(epochs, series("exp_profile_pearson_mean"), label="Profile Pearson (mean)")
+            plt.plot(epochs, series("exp_profile_pearson_median"), label="Profile Pearson (median)")
+            plt.plot(epochs, series("exp_count_pearson_mean"), label="Count Pearson (mean)")
+            plt.plot(epochs, series("exp_count_pearson_median"), label="Count Pearson (median)")
+            plt.xlabel("Epoch")
+            plt.ylabel("Correlation")
+            plt.title("Student vs Experiment validation metrics")
+            plt.legend(loc="best")
+            plt.tight_layout()
+            plt.savefig(exp_plot)
+            plt.close()
+            print(f"Saved student-vs-experiment metrics plot to {exp_plot}")
 
 
 if __name__ == "__main__":  # pragma: no cover - script entrypoint

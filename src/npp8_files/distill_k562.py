@@ -81,36 +81,40 @@ def _predict_ensemble(
         end = min(start + batch_size, n_examples)
         batch = torch.from_numpy(inputs[start:end]).to(device)
 
-        prob_accum = None
-        logcount_stack = []
+        track_accum = None
 
         for model in models:
             with torch.no_grad():
                 y_profile, y_counts = model(batch)
                 flat = y_profile.reshape(y_profile.shape[0], -1)
                 log_probs = log_softmax(flat).reshape_as(y_profile)
+            
             log_probs_np = log_probs.detach().cpu().numpy()
             log_counts_np = y_counts.detach().cpu().numpy()
+            
             probs_np = np.exp(log_probs_np).astype(np.float32, copy=False)
+            total_counts_np = np.exp(log_counts_np).astype(np.float32, copy=False) - 1.0
+            track_np = probs_np * total_counts_np.reshape(-1, 1, 1)
 
-            if prob_accum is None:
-                prob_accum = probs_np
+            if track_accum is None:
+                track_accum = track_np
             else:
-                prob_accum += probs_np
+                track_accum += track_np
 
-            logcount_stack.append(log_counts_np)
+        # Average the tracks
+        track_avg = track_accum / float(len(models))
 
-        prob_avg = prob_accum / float(len(models))
-        logcount_avg = np.mean(np.stack(logcount_stack, axis=0), axis=0)
-        total_counts = np.exp(logcount_avg).astype(np.float32, copy=False)
-        profile_counts = prob_avg * total_counts.reshape(-1, 1, 1)
+        # Derive total_counts from averaged track
+        total_counts_avg = track_avg.reshape(track_avg.shape[0], -1).sum(axis=1, keepdims=True) + 1.0
+
+        # Derive probabilities from averaged track and total_counts
+        prob_avg = track_avg / np.clip(total_counts_avg.reshape(-1, 1, 1) - 1.0, 1e-12, None)
 
         log_prob_out[start:end] = np.log(np.clip(prob_avg, 1e-12, None)).astype(np.float32, copy=False)
-        log_count_out[start:end] = logcount_avg.astype(np.float32, copy=False)
-        profile_counts_out[start:end] = profile_counts.astype(np.float32, copy=False)
+        log_count_out[start:end] = np.log(np.clip(total_counts_avg, 1e-12, None)).astype(np.float32, copy=False)
+        profile_counts_out[start:end] = track_avg.astype(np.float32, copy=False)
 
     return log_prob_out, log_count_out, profile_counts_out
-
 
 def _stack_batches(batches: Iterable[np.ndarray]) -> np.ndarray:
     arrays = list(batches)
