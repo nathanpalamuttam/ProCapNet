@@ -32,6 +32,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Optional rolling window over epochs (>=1; 1 disables)",
     )
     p.add_argument(
+        "--hide-val-mnll",
+        action="store_true",
+        help="Exclude 'Val MNLL' from the main metrics plot to better see other curves.",
+    )
+    p.add_argument(
         "--loss-out",
         type=Path,
         default=None,
@@ -152,6 +157,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         "Val MNLL",
         "Val Count log1pMSE",
     ]
+    if args.hide_val_mnll:
+        series_names.remove("Val MNLL")
 
     # Apply smoothing; keep aligned x by trimming to valid range
     smooth = max(1, int(args.smooth))
