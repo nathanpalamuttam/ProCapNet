@@ -194,8 +194,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-limit", type=int, default=None, help="Optional cap on training samples.")
     parser.add_argument("--val-limit", type=int, default=None, help="Optional cap on validation samples.")
-    parser.add_argument("--n-filters", type=int, default=256)
-    parser.add_argument("--n-layers", type=int, default=6)
+    parser.add_argument("--n-filters", type=int, default=512)
+    parser.add_argument("--n-layers", type=int, default=8)
     parser.add_argument(
         "--output-dir",
         type=Path,

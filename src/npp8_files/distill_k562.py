@@ -1,11 +1,16 @@
-"""Utilities to generate teacher labels and augmented inputs for K562 distillation."""
+"""Utilities for K562 distillation.
+
+Adds a streaming mode that trains a student directly from
+DistillerPeakGenerator batches while matching a teacher ensemble and
+optionally using binary labels (peak/background) to suppress background.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple, Optional
 
 import numpy as np
 import torch
@@ -13,14 +18,16 @@ import torch
 proj_root = Path(__file__).resolve().parents[2]
 train_src = proj_root / "src" / "2_train_models"
 utils_src = proj_root / "src" / "utils"
+npp8_src = proj_root / "src" / "npp8_files"
 
 import sys
-if str(train_src) not in sys.path:
-    sys.path.append(str(train_src))
-if str(utils_src) not in sys.path:
-    sys.path.append(str(utils_src))
+for p in (train_src, utils_src, npp8_src):
+    ps = str(p)
+    if ps not in sys.path:
+        sys.path.append(ps)
 
 from BPNet_strand_merged_umap import Model  # type: ignore  # noqa: E402
+from data_loader import DistillerPeakGenerator  # type: ignore  # noqa: E402
 from misc import ensure_parent_dir_exists  # type: ignore  # noqa: E402
 
 from gen_one_hot_encoding import augment_onehot_sequences  # type: ignore  # noqa: E402
@@ -116,6 +123,197 @@ def _predict_ensemble(
 
     return log_prob_out, log_count_out, profile_counts_out
 
+
+def _make_streaming_loader(
+    cell_type: str,
+    in_window: int = 2114,
+    out_window: int = 1000,
+    batch_size: int = 64,
+    negative_ratio: float = 0.125,
+    max_jitter: int = 1024,
+    reverse_complement: bool = True,
+    seed: int = 42,
+    verbose: bool = True,
+):
+    genome_path = proj_root / "genomes" / "hg38.withrDNA.fasta"
+    peaks = proj_root / "data" / "procap" / "processed" / cell_type / "peaks.bed.gz"
+    neg = proj_root / "data" / "procap" / "processed" / cell_type / "dnase_peaks_no_procap_overlap.bed.gz"
+    if not peaks.exists() or not neg.exists() or not genome_path.exists():
+        missing = [p for p in (genome_path, peaks, neg) if not p.exists()]
+        raise FileNotFoundError(f"Missing required inputs for streaming loader: {missing}")
+
+    loader = DistillerPeakGenerator(
+        peaks=str(peaks),
+        negatives=str(neg),
+        sequences=str(genome_path),
+        controls=None,
+        chroms=None,
+        in_window=in_window,
+        out_window=out_window,
+        max_jitter=max_jitter,
+        negative_ratio=negative_ratio,
+        reverse_complement=reverse_complement,
+        shuffle=True,
+        random_state=seed,
+        pin_memory=torch.cuda.is_available(),
+        num_workers=0,
+        batch_size=batch_size,
+        verbose=verbose,
+    )
+    return loader
+
+
+@torch.no_grad()
+def _teacher_batch(
+    models: Sequence[Model], X: torch.Tensor, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (teacher_log_probs, teacher_log_counts) as torch tensors on device."""
+    log_softmax = torch.nn.LogSoftmax(dim=-1)
+    prob_accum: Optional[torch.Tensor] = None
+    total_accum: Optional[torch.Tensor] = None
+
+    for m in models:
+        m.eval()
+        logits, log_counts = m(X)
+        flat = logits.reshape(logits.shape[0], -1)
+        log_probs = log_softmax(flat).reshape_as(logits)
+        probs = torch.exp(log_probs)
+        total = torch.exp(log_counts) - 1.0
+        
+        if prob_accum is None:
+            prob_accum = probs
+            total_accum = total
+        else:
+            prob_accum = prob_accum + probs
+            total_accum = total_accum + total
+
+    assert prob_accum is not None and total_accum is not None
+    
+    # Average the profiles and counts separately
+    prob_avg = prob_accum / float(len(models))
+    total_avg = total_accum / float(len(models))
+    
+    # Then compute the track from averaged quantities
+    track_avg = prob_avg * total_avg.view(-1, 1, 1)
+    
+    # Normalize to get final probabilities
+    total_avg_expanded = total_avg.view(-1, 1, 1)
+    prob_final = track_avg / torch.clamp(total_avg_expanded, min=1e-12)
+
+    teacher_log_probs = torch.log(torch.clamp(prob_final, min=1e-12))
+    teacher_log_counts = torch.log(torch.clamp(total_avg + 1.0, min=1e-12))
+    return teacher_log_probs, teacher_log_counts
+
+
+def run_streaming_training(
+    cell_type: str = "K562",
+    timestamps: Sequence[str] = (),
+    epochs: int = 2,
+    batch_size: int = 64,
+    learning_rate: float = 1e-4,
+    count_loss_weight: float = 0.1,
+    bg_suppress_weight: float = 0.1,
+    seed: int = 42,
+    out_dir: Optional[Path] = None,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Student model
+    trimming = (2114 - 1000) // 2
+    student = Model(
+        model_save_path=str((out_dir or proj_root / "models" / "distilled_student_streaming") / "student_v2.model"),
+        n_filters=512,
+        n_layers=8,
+        trimming=trimming,
+    ).to(device)
+
+    # Teachers
+    if not timestamps:
+        timestamps = tuple(DEFAULT_TIMESTAMPS)
+    teachers = _load_teacher_models(timestamps, cell_type, device)
+
+    # Data
+    loader = _make_streaming_loader(
+        cell_type=cell_type,
+        batch_size=batch_size,
+        negative_ratio=0.125,
+        max_jitter=1024,
+        reverse_complement=True,
+        seed=seed,
+        verbose=True,
+    )
+
+    opt = torch.optim.Adam(student.parameters(), lr=learning_rate)
+    log_softmax = torch.nn.LogSoftmax(dim=-1)
+
+    history: List[dict] = []
+    for epoch in range(1, epochs + 1):
+        student.train()
+        epoch_prob, epoch_count, epoch_bg = [], [], []
+        for batch in loader:
+            if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                X, y = batch
+            else:
+                X, _Xctl, y = batch  # controls path
+
+            X = X.to(device, dtype=torch.float32, non_blocking=True)
+            y = y.to(device)
+
+            with torch.no_grad():
+                t_log_probs, t_log_counts = _teacher_batch(teachers, X, device)
+
+            logits, s_log_counts = student(X)
+            flat = logits.reshape(logits.shape[0], -1)
+            s_log_probs = log_softmax(flat).reshape_as(logits)
+
+            # KD losses
+            kd_prob = torch.nn.functional.kl_div(
+                s_log_probs.view(X.size(0), -1),
+                torch.exp(t_log_probs).view(X.size(0), -1),
+                reduction="batchmean",
+                log_target=False,
+            )
+            kd_count = torch.nn.functional.mse_loss(s_log_counts, t_log_counts)
+
+            # Label-guided background suppression (negatives only)
+            neg_mask = (y == 0)
+            if neg_mask.any():
+                bg_loss = torch.nn.functional.mse_loss((s_log_counts[neg_mask]).float(), torch.zeros_like(s_log_counts[neg_mask]))
+            else:
+                bg_loss = torch.tensor(0.0, device=device)
+
+            loss = kd_prob + count_loss_weight * kd_count + bg_suppress_weight * bg_loss
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            epoch_prob.append(kd_prob.detach())
+            epoch_count.append(kd_count.detach())
+            epoch_bg.append(bg_loss.detach())
+
+        rec = {
+            "epoch": epoch,
+            "train_prob": float(torch.stack(epoch_prob).mean().item() if epoch_prob else 0.0),
+            "train_count": float(torch.stack(epoch_count).mean().item() if epoch_count else 0.0),
+            "train_bg": float(torch.stack(epoch_bg).mean().item() if epoch_bg else 0.0),
+        }
+        history.append(rec)
+        print(
+            f"Epoch {epoch:02d}: KD(prob)={rec['train_prob']:.4f} KD(count)={rec['train_count']:.4f} BG={rec['train_bg']:.4f}"
+        )
+
+    # Save student
+    out_dir = out_dir or (proj_root / "models" / "distilled_student_streaming")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({"epoch": epochs, "model": student.state_dict()}, out_dir / "student_best.pt")
+    with (out_dir / "training_metrics.jsonl").open("w") as handle:
+        import json
+        for row in history:
+            handle.write(json.dumps(row) + "\n")
+    print(f"Saved streaming student to {out_dir}")
+
 def _stack_batches(batches: Iterable[np.ndarray]) -> np.ndarray:
     arrays = list(batches)
     if not arrays:
@@ -128,121 +326,6 @@ def _write_metadata(metadata_path: Path, metadata: dict) -> None:
     with metadata_path.open("w") as handle:
         json.dump(metadata, handle, indent=2)
 
-
-def run_pipeline(
-    cell_type: str = "K562",
-    timestamps: Sequence[str] = DEFAULT_TIMESTAMPS,
-    batch_size: int = 128,
-    device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
-    num_augmentations: int = 1,
-    shift_range: int = 1024,
-    rc_prob: float = 0.5,
-    base_seed: int = 123,
-    output_dir: Path | None = None,
-) -> None:
-    device = torch.device(device_str)
-
-    sequence_path = proj_root / "data" / "procap" / "processed" / cell_type / "onehot_seqs_2114.npy"
-    if not sequence_path.exists():
-        raise FileNotFoundError(f"Missing one-hot training sequences at {sequence_path}")
-
-    print(f"Loading base sequences from {sequence_path}")
-    base_sequences = np.load(sequence_path)
-    if base_sequences.dtype != np.float32:
-        base_sequences = base_sequences.astype(np.float32, copy=False)
-
-    models = _load_teacher_models(timestamps, cell_type, device)
-
-    print("Generating teacher predictions for base sequences...")
-    base_log_probs, base_log_counts, base_profile_counts = _predict_ensemble(
-        models,
-        base_sequences,
-        device,
-        batch_size,
-    )
-
-    all_inputs = [base_sequences]
-    all_log_probs = [base_log_probs]
-    all_log_counts = [base_log_counts]
-    all_profile_counts = [base_profile_counts]
-    augment_indices = [np.arange(base_sequences.shape[0], dtype=np.int64)]
-    augment_ids = [np.zeros(base_sequences.shape[0], dtype=np.int16)]
-
-    for aug_idx in range(1, num_augmentations + 1):
-        seed = base_seed + aug_idx
-        print(f"Augmenting sequences (augmentation #{aug_idx}, seed={seed})")
-        aug_sequences, _ = augment_onehot_sequences(
-            base_sequences,
-            outputs=None,
-            shift_range=shift_range,
-            rc_prob=rc_prob,
-            seed=seed,
-        )
-        aug_sequences = aug_sequences.astype(np.float32, copy=False)
-        aug_inputs = aug_sequences
-
-        print("Generating teacher predictions for augmented sequences...")
-        aug_log_probs, aug_log_counts, aug_profile_counts = _predict_ensemble(
-            models,
-            aug_inputs,
-            device,
-            batch_size,
-        )
-
-        all_inputs.append(aug_inputs)
-        all_log_probs.append(aug_log_probs)
-        all_log_counts.append(aug_log_counts)
-        all_profile_counts.append(aug_profile_counts)
-
-        augment_indices.append(np.arange(base_sequences.shape[0], dtype=np.int64))
-        augment_ids.append(np.full(base_sequences.shape[0], aug_idx, dtype=np.int16))
-
-    inputs_full = _stack_batches(all_inputs)
-    log_probs_full = _stack_batches(all_log_probs)
-    log_counts_full = _stack_batches(all_log_counts)
-    profile_counts_full = _stack_batches(all_profile_counts)
-    origin_indices = _stack_batches(augment_indices)
-    augmentation_ids = _stack_batches(augment_ids)
-
-    if output_dir is None:
-        output_dir = proj_root / "data" / "procap" / "processed" / cell_type / "distillation"
-    else:
-        output_dir = Path(output_dir)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    dataset_path = output_dir / "distillation_dataset_k562.npz"
-    print(f"Writing aggregated dataset to {dataset_path}")
-    np.savez_compressed(
-        dataset_path,
-        inputs=inputs_full.astype(np.float32),
-        teacher_log_probs=log_probs_full,
-        teacher_log_counts=log_counts_full,
-        teacher_profile_counts=profile_counts_full,
-        origin_index=origin_indices,
-        augmentation_id=augmentation_ids,
-    )
-
-    metadata = {
-        "cell_type": cell_type,
-        "timestamps": list(timestamps),
-        "batch_size": batch_size,
-        "device": device_str,
-        "num_augmentations": num_augmentations,
-        "shift_range": shift_range,
-        "rc_prob": rc_prob,
-        "base_seed": base_seed,
-        "sequence_path": str(sequence_path),
-        "dataset_path": str(dataset_path),
-        "n_examples_original": int(base_sequences.shape[0]),
-        "n_examples_total": int(inputs_full.shape[0]),
-    }
-
-    metadata_path = output_dir / "distillation_dataset_k562.json"
-    _write_metadata(metadata_path, metadata)
-    print(f"Saved metadata to {metadata_path}")
-
-
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare K562 distillation dataset")
     parser.add_argument("--cell-type", default="K562")
@@ -254,6 +337,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rc-prob", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--stream", action="store_true", help="Run streaming KD training instead of building NPZ")
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--count-loss-weight", type=float, default=0.1)
+    parser.add_argument("--bg-suppress-weight", type=float, default=0.1)
     return parser
 
 
@@ -262,18 +349,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-    run_pipeline(
+    out_dir = Path(args.output_dir) if args.output_dir else None
+    run_streaming_training(
         cell_type=args.cell_type,
-        timestamps=args.timestamps,
+        timestamps=args.timestamps or tuple(DEFAULT_TIMESTAMPS),
+        epochs=max(1, args.epochs),
         batch_size=args.batch_size,
-        device_str=device_str,
-        num_augmentations=max(0, args.num_augmentations),
-        shift_range=args.shift_range,
-        rc_prob=args.rc_prob,
-        base_seed=args.seed,
-        output_dir=Path(args.output_dir) if args.output_dir else None,
+        learning_rate=1e-4,
+        count_loss_weight=args.count_loss_weight,
+        bg_suppress_weight=args.bg_suppress_weight,
+        seed=args.seed,
+        out_dir=out_dir,
     )
+    
 
 
 if __name__ == "__main__":
