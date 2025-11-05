@@ -29,8 +29,8 @@ for p in (train_src, utils_src, npp8_src):
 from BPNet_strand_merged_umap import Model  # type: ignore  # noqa: E402
 from data_loader import DistillerPeakGenerator  # type: ignore  # noqa: E402
 from misc import ensure_parent_dir_exists  # type: ignore  # noqa: E402
+from losses import MNLLLoss, log1pMSELoss  # type: ignore  # noqa: E402
 
-from gen_one_hot_encoding import augment_onehot_sequences  # type: ignore  # noqa: E402
 
 
 DEFAULT_TIMESTAMPS = (
@@ -55,7 +55,7 @@ def _load_teacher_models(timestamps: Sequence[str], cell_type: str, device: torc
         if not model_path.exists():
             raise FileNotFoundError(f"Missing teacher checkpoint: {model_path}")
 
-        model: Model = torch.load(model_path, map_location=device)
+        model: Model = torch.load(model_path, map_location=device, weights_only = False)
         model = model.to(device)
         model.eval()
         models.append(model)
@@ -193,26 +193,84 @@ def _teacher_batch(
     prob_avg = prob_accum / float(len(models))
     total_avg = total_accum / float(len(models))
     
-    # Then compute the track from averaged quantities
-    track_avg = prob_avg * total_avg.view(-1, 1, 1)
+    # Compute the track (profile counts) from averaged quantities
+    profile_counts = prob_avg * total_avg.view(-1, 1, 1)
     
-    # Normalize to get final probabilities
-    total_avg_expanded = total_avg.view(-1, 1, 1)
-    prob_final = track_avg / torch.clamp(total_avg_expanded, min=1e-12)
-
-    teacher_log_probs = torch.log(torch.clamp(prob_final, min=1e-12))
     teacher_log_counts = torch.log(torch.clamp(total_avg + 1.0, min=1e-12))
-    return teacher_log_probs, teacher_log_counts
+    return profile_counts, teacher_log_counts
+
+
+def _distillation_loss(
+    student_logits: torch.Tensor,
+    student_log_counts: torch.Tensor,
+    teacher_profile_counts: torch.Tensor,
+    teacher_log_counts: torch.Tensor,
+    count_loss_weight: float,
+    labels: torch.Tensor
+) -> Tuple[float, float, torch.Tensor]:
+    """Compute distillation loss using mixture loss on teacher profile counts.
+    
+    Parameters
+    ----------
+    student_logits: torch.Tensor
+        Student model logits (unnormalized)
+    student_log_counts: torch.Tensor
+        Student model log counts
+    teacher_profile_counts: torch.Tensor
+        Teacher ensemble profile counts (treated as "ground truth" y)
+    teacher_log_counts: torch.Tensor
+        Teacher ensemble log counts
+    count_loss_weight: float
+        Weight for count loss
+    labels: torch.Tensor, optional
+        Binary labels (1=peak, 0=background) for label-guided training
+        
+    Returns
+    -------
+    profile_loss: float
+        Profile loss value (for logging)
+    count_loss: float
+        Count loss value (for logging)
+    total_loss: torch.Tensor
+        Combined loss for backpropagation
+    """
+    # Flatten and normalize student logits
+    student_logits_flat = student_logits.reshape(student_logits.shape[0], -1)
+    student_log_probs = torch.nn.functional.log_softmax(student_logits_flat, dim=-1)
+    
+    # Flatten teacher profile counts (these are our "y" - the pseudo ground truth)
+    teacher_counts_flat = teacher_profile_counts.reshape(teacher_profile_counts.shape[0], -1)
+    
+    # Calculate profile loss using MNLL
+    if labels is not None:
+        # Only compute loss on peaks (labels == 1)
+        profile_loss = MNLLLoss(student_log_probs[labels == 1], teacher_counts_flat[labels == 1]).mean()
+    else:
+        profile_loss = MNLLLoss(student_log_probs, teacher_counts_flat).mean()
+    
+    # Calculate count loss
+    count_loss = log1pMSELoss(student_log_counts, torch.exp(teacher_log_counts) - 1.0).mean()
+    
+    # Extract values for logging
+    profile_loss_val = profile_loss.item()
+    count_loss_val = count_loss.item()
+    
+    # Mix losses together
+    total_loss = profile_loss + count_loss_weight * count_loss
+    
+    return profile_loss_val, count_loss_val, total_loss
 
 
 def run_streaming_training(
     cell_type: str = "K562",
     timestamps: Sequence[str] = (),
-    epochs: int = 2,
+    epochs: int = 100,
     batch_size: int = 64,
     learning_rate: float = 1e-4,
     count_loss_weight: float = 0.1,
     bg_suppress_weight: float = 0.1,
+    mutation_rate: float = 0.04,
+    sv_rate: float = 1.0,
     seed: int = 42,
     out_dir: Optional[Path] = None,
 ):
@@ -246,7 +304,6 @@ def run_streaming_training(
     )
 
     opt = torch.optim.Adam(student.parameters(), lr=learning_rate)
-    log_softmax = torch.nn.LogSoftmax(dim=-1)
 
     history: List[dict] = []
     for epoch in range(1, epochs + 1):
@@ -261,48 +318,46 @@ def run_streaming_training(
             X = X.to(device, dtype=torch.float32, non_blocking=True)
             y = y.to(device)
 
+            # Get teacher predictions (profile counts, not log probs)
             with torch.no_grad():
-                t_log_probs, t_log_counts = _teacher_batch(teachers, X, device)
+                teacher_profile_counts, teacher_log_counts = _teacher_batch(teachers, X, device)
 
-            logits, s_log_counts = student(X)
-            flat = logits.reshape(logits.shape[0], -1)
-            s_log_probs = log_softmax(flat).reshape_as(logits)
+            # Get student predictions
+            student_logits, student_log_counts = student(X)
 
-            # KD losses
-            kd_prob = torch.nn.functional.kl_div(
-                s_log_probs.view(X.size(0), -1),
-                torch.exp(t_log_probs).view(X.size(0), -1),
-                reduction="batchmean",
-                log_target=False,
+            # Compute distillation loss using mixture loss
+            profile_loss_val, count_loss_val, kd_loss = _distillation_loss(
+                student_logits=student_logits,
+                student_log_counts=student_log_counts,
+                teacher_profile_counts=teacher_profile_counts,
+                teacher_log_counts=teacher_log_counts,
+                count_loss_weight=count_loss_weight,
+                labels = y
             )
-            kd_count = torch.nn.functional.mse_loss(s_log_counts, t_log_counts)
-
-            # Label-guided background suppression (negatives only)
-            neg_mask = (y == 0)
-            if neg_mask.any():
-                bg_loss = torch.nn.functional.mse_loss((s_log_counts[neg_mask]).float(), torch.zeros_like(s_log_counts[neg_mask]))
-            else:
-                bg_loss = torch.tensor(0.0, device=device)
-
-            loss = kd_prob + count_loss_weight * kd_count + bg_suppress_weight * bg_loss
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            kd_loss.backward()
             opt.step()
 
-            epoch_prob.append(kd_prob.detach())
-            epoch_count.append(kd_count.detach())
-            epoch_bg.append(bg_loss.detach())
+            epoch_prob.append(profile_loss_val)
+            epoch_count.append(count_loss_val)
 
         rec = {
             "epoch": epoch,
-            "train_prob": float(torch.stack(epoch_prob).mean().item() if epoch_prob else 0.0),
-            "train_count": float(torch.stack(epoch_count).mean().item() if epoch_count else 0.0),
-            "train_bg": float(torch.stack(epoch_bg).mean().item() if epoch_bg else 0.0),
+            "train_prob": float(np.mean(epoch_prob) if epoch_prob else 0.0),
+            "train_count": float(np.mean(epoch_count) if epoch_count else 0.0),
         }
+        if bg_suppress_weight > 0:
+            rec["train_bg"] = float(torch.stack(epoch_bg).mean().item() if epoch_bg else 0.0)
+            print(
+                f"Epoch {epoch:02d}: MNLL(profile)={rec['train_prob']:.4f} "
+                f"log1pMSE(count)={rec['train_count']:.4f} BG={rec['train_bg']:.4f}"
+            )
+        else:
+            print(
+                f"Epoch {epoch:02d}: MNLL(profile)={rec['train_prob']:.4f} "
+                f"log1pMSE(count)={rec['train_count']:.4f}"
+            )
         history.append(rec)
-        print(
-            f"Epoch {epoch:02d}: KD(prob)={rec['train_prob']:.4f} KD(count)={rec['train_count']:.4f} BG={rec['train_bg']:.4f}"
-        )
 
     # Save student
     out_dir = out_dir or (proj_root / "models" / "distilled_student_streaming")
@@ -338,9 +393,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--stream", action="store_true", help="Run streaming KD training instead of building NPZ")
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--count-loss-weight", type=float, default=0.1)
     parser.add_argument("--bg-suppress-weight", type=float, default=0.1)
+    parser.add_argument("--mutation-rate", type=float, default=0.04, help="Point mutation rate for augmentation")
+    parser.add_argument("--sv-rate", type=float, default=1.0, help="Structural variation rate (Poisson lambda)")
     return parser
 
 
@@ -358,6 +415,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         learning_rate=1e-4,
         count_loss_weight=args.count_loss_weight,
         bg_suppress_weight=args.bg_suppress_weight,
+        mutation_rate=args.mutation_rate,
+        sv_rate=args.sv_rate,
         seed=args.seed,
         out_dir=out_dir,
     )

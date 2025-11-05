@@ -68,6 +68,19 @@ class DistillerPeakNegativeSampler(torch.utils.data.Dataset):
     reverse_complement: bool, optional
             Whether to reverse complement-augment half of the data. Default is False.
 
+    mutation_rate: float, optional
+            Probability of mutating each nucleotide. Default is 0.04 (4%).
+
+    sv_rate: float, optional
+            Poisson lambda parameter for number of structural variations per sequence.
+            Default is 1.0.
+
+    sv_min_length: int, optional
+            Minimum length of structural variations. Default is 1.
+
+    sv_max_length: int, optional
+            Maximum length of structural variations. Default is 20.
+
     random_state: int or None, optional
             Whether to use a deterministic seed or not.
     """
@@ -83,6 +96,10 @@ class DistillerPeakNegativeSampler(torch.utils.data.Dataset):
         out_window=1000,
         max_jitter=0,
         reverse_complement=False,
+        mutation_rate=0.04,
+        sv_rate=1.0,
+        sv_min_length=1,
+        sv_max_length=20,
         shuffle=True,
         random_state=None,
     ):
@@ -105,6 +122,10 @@ class DistillerPeakNegativeSampler(torch.utils.data.Dataset):
         self.out_window = out_window
         self.max_jitter = max_jitter
         self.reverse_complement = reverse_complement
+        self.mutation_rate = mutation_rate
+        self.sv_rate = sv_rate
+        self.sv_min_length = sv_min_length
+        self.sv_max_length = sv_max_length
         self.shuffle = shuffle
 
         self.random_state = numpy.random.RandomState(random_state)
@@ -113,6 +134,121 @@ class DistillerPeakNegativeSampler(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.n_peaks + int(self.n_peaks * self.negative_ratio)
+
+    def _apply_point_mutations(self, Xi):
+        """Apply random point mutations to the one-hot encoded sequence.
+        
+        Parameters
+        ----------
+        Xi: torch.Tensor, shape=(4, length)
+            One-hot encoded sequence.
+            
+        Returns
+        -------
+        Xi: torch.Tensor
+            Mutated sequence.
+        """
+        if self.mutation_rate <= 0:
+            return Xi
+            
+        # Generate mutation mask
+        mutation_mask = self.random_state.uniform(size=Xi.shape[1]) < self.mutation_rate
+        n_mutations = mutation_mask.sum()
+        
+        if n_mutations > 0:
+            # Convert to numpy for easier manipulation
+            Xi_np = Xi.numpy()
+            
+            # For each position to mutate, choose a random nucleotide
+            for pos in numpy.where(mutation_mask)[0]:
+                # Zero out current nucleotide
+                Xi_np[:, pos] = 0
+                # Set random nucleotide to 1
+                new_nuc = self.random_state.randint(0, 4)
+                Xi_np[new_nuc, pos] = 1
+            
+            Xi = torch.from_numpy(Xi_np)
+        
+        return Xi
+
+    def _apply_structural_variations(self, Xi):
+        """Apply random structural variations (insertions, deletions, inversions).
+        
+        Parameters
+        ----------
+        Xi: torch.Tensor, shape=(4, length)
+            One-hot encoded sequence.
+            
+        Returns
+        -------
+        Xi: torch.Tensor
+            Sequence with structural variations applied.
+        """
+        if self.sv_rate <= 0:
+            return Xi
+            
+        # Sample number of SVs from Poisson distribution
+        n_svs = self.random_state.poisson(self.sv_rate)
+        
+        if n_svs == 0:
+            return Xi
+        
+        Xi_np = Xi.numpy()
+        seq_length = Xi_np.shape[1]
+        
+        for _ in range(n_svs):
+            # Choose SV type
+            sv_type = self.random_state.choice(['insertion', 'deletion', 'inversion'])
+            
+            # Choose SV length
+            sv_length = self.random_state.randint(self.sv_min_length, self.sv_max_length + 1)
+            
+            # Choose random position (ensure we don't go out of bounds)
+            if sv_type == 'insertion':
+                pos = self.random_state.randint(0, seq_length)
+                # Generate random sequence for insertion
+                random_seq = numpy.zeros((4, sv_length), dtype=Xi_np.dtype)
+                random_nucs = self.random_state.randint(0, 4, size=sv_length)
+                random_seq[random_nucs, numpy.arange(sv_length)] = 1
+                
+                # Insert the random sequence
+                Xi_np = numpy.concatenate([Xi_np[:, :pos], random_seq, Xi_np[:, pos:]], axis=1)
+                seq_length += sv_length
+                
+            elif sv_type == 'deletion':
+                if seq_length <= sv_length:
+                    continue  # Skip if deletion would remove entire sequence
+                pos = self.random_state.randint(0, seq_length - sv_length + 1)
+                # Delete the region
+                Xi_np = numpy.concatenate([Xi_np[:, :pos], Xi_np[:, pos + sv_length:]], axis=1)
+                seq_length -= sv_length
+                
+            elif sv_type == 'inversion':
+                if seq_length <= sv_length:
+                    continue  # Skip if inversion region is larger than sequence
+                pos = self.random_state.randint(0, seq_length - sv_length + 1)
+                # Invert the region (flip along position axis and complement)
+                region = Xi_np[:, pos:pos + sv_length]
+                # Flip positions
+                region = numpy.flip(region, axis=1).copy()
+                # Complement: A<->T (indices 0<->3), C<->G (indices 1<->2)
+                region = region[[3, 2, 1, 0], :]
+                Xi_np[:, pos:pos + sv_length] = region
+        
+        # Ensure we maintain the correct window size by cropping or padding
+        if Xi_np.shape[1] > self.in_window:
+            # Crop from center
+            excess = Xi_np.shape[1] - self.in_window
+            start = excess // 2
+            Xi_np = Xi_np[:, start:start + self.in_window]
+        elif Xi_np.shape[1] < self.in_window:
+            # Pad with zeros (representing ambiguous nucleotides)
+            deficit = self.in_window - Xi_np.shape[1]
+            pad_left = deficit // 2
+            pad_right = deficit - pad_left
+            Xi_np = numpy.pad(Xi_np, ((0, 0), (pad_left, pad_right)), mode='constant', constant_values=0)
+        
+        return torch.from_numpy(Xi_np)
 
     def __getitem__(self, idx):
         if idx == 0:
@@ -138,6 +274,12 @@ class DistillerPeakNegativeSampler(torch.utils.data.Dataset):
         Xi = torch.from_numpy(X[idx][:, jitter : jitter + self.in_window])
         if self.peak_controls is not None:
             Xi_ctl = torch.from_numpy(X_ctl[idx][:, jitter : jitter + self.in_window])
+
+        # Apply point mutations
+        Xi = self._apply_point_mutations(Xi)
+        
+        # Apply structural variations
+        Xi = self._apply_structural_variations(Xi)
 
         if self.reverse_complement and self.random_state.randint(2) == 1:
             Xi = torch.flip(Xi, [0, 1])
@@ -198,6 +340,19 @@ class DistillerDataGenerator(torch.utils.data.Dataset):
     reverse_complement: bool, optional
             Whether to reverse complement-augment half of the data. Default is False.
 
+    mutation_rate: float, optional
+            Probability of mutating each nucleotide. Default is 0.04 (4%).
+
+    sv_rate: float, optional
+            Poisson lambda parameter for number of structural variations per sequence.
+            Default is 1.0.
+
+    sv_min_length: int, optional
+            Minimum length of structural variations. Default is 1.
+
+    sv_max_length: int, optional
+            Maximum length of structural variations. Default is 20.
+
     random_state: int or None, optional
             Whether to use a deterministic seed or not.
     """
@@ -211,6 +366,10 @@ class DistillerDataGenerator(torch.utils.data.Dataset):
         out_window=1000,
         max_jitter=0,
         reverse_complement=False,
+        mutation_rate=0.04,
+        sv_rate=1.0,
+        sv_min_length=1,
+        sv_max_length=20,
         random_state=None,
     ):
         self.p = p
@@ -219,6 +378,10 @@ class DistillerDataGenerator(torch.utils.data.Dataset):
         self.max_jitter = max_jitter
 
         self.reverse_complement = reverse_complement
+        self.mutation_rate = mutation_rate
+        self.sv_rate = sv_rate
+        self.sv_min_length = sv_min_length
+        self.sv_max_length = sv_max_length
         self.random_state = numpy.random.RandomState(random_state)
 
         self.controls = controls
@@ -229,6 +392,78 @@ class DistillerDataGenerator(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.sequences)
+
+    def _apply_point_mutations(self, X):
+        """Apply random point mutations to the one-hot encoded sequence."""
+        if self.mutation_rate <= 0:
+            return X
+            
+        mutation_mask = self.random_state.uniform(size=X.shape[1]) < self.mutation_rate
+        n_mutations = mutation_mask.sum()
+        
+        if n_mutations > 0:
+            X_np = X.numpy()
+            for pos in numpy.where(mutation_mask)[0]:
+                X_np[:, pos] = 0
+                new_nuc = self.random_state.randint(0, 4)
+                X_np[new_nuc, pos] = 1
+            X = torch.from_numpy(X_np)
+        
+        return X
+
+    def _apply_structural_variations(self, X):
+        """Apply random structural variations (insertions, deletions, inversions)."""
+        if self.sv_rate <= 0:
+            return X
+            
+        n_svs = self.random_state.poisson(self.sv_rate)
+        
+        if n_svs == 0:
+            return X
+        
+        X_np = X.numpy()
+        seq_length = X_np.shape[1]
+        
+        for _ in range(n_svs):
+            sv_type = self.random_state.choice(['insertion', 'deletion', 'inversion'])
+            sv_length = self.random_state.randint(self.sv_min_length, self.sv_max_length + 1)
+            
+            if sv_type == 'insertion':
+                pos = self.random_state.randint(0, seq_length)
+                random_seq = numpy.zeros((4, sv_length), dtype=X_np.dtype)
+                random_nucs = self.random_state.randint(0, 4, size=sv_length)
+                random_seq[random_nucs, numpy.arange(sv_length)] = 1
+                X_np = numpy.concatenate([X_np[:, :pos], random_seq, X_np[:, pos:]], axis=1)
+                seq_length += sv_length
+                
+            elif sv_type == 'deletion':
+                if seq_length <= sv_length:
+                    continue
+                pos = self.random_state.randint(0, seq_length - sv_length + 1)
+                X_np = numpy.concatenate([X_np[:, :pos], X_np[:, pos + sv_length:]], axis=1)
+                seq_length -= sv_length
+                
+            elif sv_type == 'inversion':
+                if seq_length <= sv_length:
+                    continue
+                pos = self.random_state.randint(0, seq_length - sv_length + 1)
+                region = X_np[:, pos:pos + sv_length]
+                region = numpy.flip(region, axis=1).copy()
+                region = region[[3, 2, 1, 0], :]
+                X_np[:, pos:pos + sv_length] = region
+        
+        # Maintain correct window size
+        if X_np.shape[1] > self.in_window:
+            excess = X_np.shape[1] - self.in_window
+            start = excess // 2
+            X_np = X_np[:, start:start + self.in_window]
+        elif X_np.shape[1] < self.in_window:
+            deficit = self.in_window - X_np.shape[1]
+            pad_left = deficit // 2
+            pad_right = deficit - pad_left
+            X_np = numpy.pad(X_np, ((0, 0), (pad_left, pad_right)), mode='constant', constant_values=0)
+        
+        return torch.from_numpy(X_np)
 
     def __getitem__(self, idx):
         if idx % self.n_random == 0:
@@ -247,6 +482,12 @@ class DistillerDataGenerator(torch.utils.data.Dataset):
 
         if self.controls is not None:
             X_ctl = self.controls[i][:, j : j + self.in_window]
+
+        # Apply point mutations
+        X = self._apply_point_mutations(X)
+        
+        # Apply structural variations
+        X = self._apply_structural_variations(X)
 
         if self.reverse_complement and self.random_state.choice(2) == 1:
             X = torch.flip(X, [0, 1])
@@ -271,6 +512,10 @@ def DistillerPeakGenerator(
     max_jitter=128,
     negative_ratio=0.1,
     reverse_complement=True,
+    mutation_rate=0.04,
+    sv_rate=1.0,
+    sv_min_length=1,
+    sv_max_length=20,
     shuffle=True,
     min_counts=None,
     max_counts=None,
@@ -345,6 +590,19 @@ def DistillerPeakGenerator(
 
     reverse_complement: bool, optional
             Whether to reverse complement-augment half of the data. Default is True.
+
+    mutation_rate: float, optional
+            Probability of mutating each nucleotide. Default is 0.04 (4%).
+
+    sv_rate: float, optional
+            Poisson lambda parameter for number of structural variations per sequence.
+            Default is 1.0.
+
+    sv_min_length: int, optional
+            Minimum length of structural variations. Default is 1.
+
+    sv_max_length: int, optional
+            Maximum length of structural variations. Default is 20.
 
     shuffle: bool, optional
             Whether to randomly sample peaks, if True, or to proceed sequentially
@@ -468,6 +726,10 @@ def DistillerPeakGenerator(
         out_window=out_window,
         max_jitter=max_jitter,
         reverse_complement=reverse_complement,
+        mutation_rate=mutation_rate,
+        sv_rate=sv_rate,
+        sv_min_length=sv_min_length,
+        sv_max_length=sv_max_length,
         shuffle=shuffle,
         random_state=random_state,
     )
