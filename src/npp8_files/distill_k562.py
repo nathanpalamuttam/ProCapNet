@@ -163,6 +163,54 @@ def _make_streaming_loader(
     return loader
 
 
+def _get_cached_data_path(cell_type: str, seed: int) -> Path:
+    """Get path to cached streaming loader data."""
+    cache_dir = proj_root / "data" / "procap" / "cached_streaming_data"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{cell_type}_seed{seed}_streaming_batches.npz"
+
+
+def _save_streaming_data(loader, cache_path: Path, verbose: bool = True):
+    """Collect all batches from streaming loader and save to disk."""
+    if verbose:
+        print(f"Collecting and saving streaming data to {cache_path}...")
+
+    X_batches = []
+    y_batches = []
+
+    for batch in loader:
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            X, y = batch
+        else:
+            X, _Xctl, y = batch  # controls path
+
+        X_batches.append(X.cpu().numpy())
+        y_batches.append(y.cpu().numpy())
+
+    np.savez_compressed(cache_path, X=X_batches, y=y_batches)
+    if verbose:
+        print(f"Saved {len(X_batches)} batches to {cache_path}")
+
+
+def _load_streaming_data(cache_path: Path, verbose: bool = True):
+    """Load cached streaming data and return as iterator."""
+    if not cache_path.exists():
+        raise FileNotFoundError(f"Cached data not found at {cache_path}. Run with streaming loader first to generate cache.")
+
+    if verbose:
+        print(f"Loading cached streaming data from {cache_path}...")
+
+    data = np.load(cache_path, allow_pickle=True)
+    X_batches = data['X']
+    y_batches = data['y']
+
+    if verbose:
+        print(f"Loaded {len(X_batches)} batches from cache")
+
+    # Return as list of tuples to match streaming loader interface
+    return [(X, y) for X, y in zip(X_batches, y_batches)]
+
+
 @torch.no_grad()
 def _teacher_batch(
     models: Sequence[Model], X: torch.Tensor, device: torch.device
@@ -273,6 +321,7 @@ def run_streaming_training(
     sv_rate: float = 1.0,
     seed: int = 42,
     out_dir: Optional[Path] = None,
+    use_streaming_loader: bool = True,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -292,16 +341,27 @@ def run_streaming_training(
         timestamps = tuple(DEFAULT_TIMESTAMPS)
     teachers = _load_teacher_models(timestamps, cell_type, device)
 
-    # Data
-    loader = _make_streaming_loader(
-        cell_type=cell_type,
-        batch_size=batch_size,
-        negative_ratio=0.125,
-        max_jitter=1024,
-        reverse_complement=True,
-        seed=seed,
-        verbose=True,
-    )
+    # Data - either from streaming loader or cached file
+    cache_path = _get_cached_data_path(cell_type, seed)
+
+    if use_streaming_loader:
+        print("Using streaming loader to generate data...")
+        loader = _make_streaming_loader(
+            cell_type=cell_type,
+            batch_size=batch_size,
+            negative_ratio=0.125,
+            max_jitter=1024,
+            reverse_complement=True,
+            seed=seed,
+            verbose=True,
+        )
+        # Save to cache for future use
+        _save_streaming_data(loader, cache_path, verbose=True)
+        # Reload from cache so we can iterate multiple epochs
+        data_batches = _load_streaming_data(cache_path, verbose=True)
+    else:
+        print("Loading data from cache (streaming loader disabled)...")
+        data_batches = _load_streaming_data(cache_path, verbose=True)
 
     opt = torch.optim.Adam(student.parameters(), lr=learning_rate)
 
@@ -309,11 +369,14 @@ def run_streaming_training(
     for epoch in range(1, epochs + 1):
         student.train()
         epoch_prob, epoch_count, epoch_bg = [], [], []
-        for batch in loader:
-            if isinstance(batch, (list, tuple)) and len(batch) == 2:
-                X, y = batch
-            else:
-                X, _Xctl, y = batch  # controls path
+        for batch in data_batches:
+            X, y = batch
+
+            # Convert to tensors if they're numpy arrays
+            if isinstance(X, np.ndarray):
+                X = torch.from_numpy(X)
+            if isinstance(y, np.ndarray):
+                y = torch.from_numpy(y)
 
             X = X.to(device, dtype=torch.float32, non_blocking=True)
             y = y.to(device)
@@ -393,11 +456,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--stream", action="store_true", help="Run streaming KD training instead of building NPZ")
+    parser.add_argument("--no-streaming-loader", dest="use_streaming_loader", action="store_false", help="Load from cached data instead of streaming loader")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--count-loss-weight", type=float, default=0.1)
     parser.add_argument("--bg-suppress-weight", type=float, default=0.1)
     parser.add_argument("--mutation-rate", type=float, default=0.04, help="Point mutation rate for augmentation")
     parser.add_argument("--sv-rate", type=float, default=1.0, help="Structural variation rate (Poisson lambda)")
+    parser.set_defaults(use_streaming_loader=True)
     return parser
 
 
@@ -419,6 +484,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         sv_rate=args.sv_rate,
         seed=args.seed,
         out_dir=out_dir,
+        use_streaming_loader=args.use_streaming_loader,
     )
     
 
