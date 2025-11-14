@@ -1,157 +1,240 @@
-# ProCapNet: Dissecting the *cis*-regulatory syntax of transcription initiation with deep learning
+# ProCapNet Model Distillation
 
-This repository contains all of the code used for data downloading and processing, model training, evaluation, and interpretation, and downstream analyses used in the ProCapNet paper (preprint: https://www.biorxiv.org/content/10.1101/2024.05.28.596138v2).
+This directory contains the implementation of knowledge distillation for ProCapNet models, enabling the compression of an ensemble of teacher models into a single, efficient student model.
 
-In this project, we trained a neural network to predict transcription initiation (measured by PRO-cap experiments) at base-resolution using the BPNet model framework. We then interpreted the model to discover initiation-predictive sequence motifs, characterize how the epistasis between these motifs regulates the rate and positioning of transcription initiation, investigate the sequence logic behind enhancer-RNA, and more.
+## Overview
+
+Knowledge distillation is a model compression technique that transfers knowledge from a larger, more complex model (or ensemble of models) to a smaller, more efficient model. In the context of ProCapNet:
+
+- **Teacher Models**: An ensemble of 7 trained ProCapNet models that predict transcription initiation profiles
+- **Student Model**: A single BPNet model that learns to replicate the ensemble's predictions
+- **Key Advantage**: Achieves near-ensemble performance with significantly reduced computational cost and memory footprint
+
+## Architecture
+
+### Teacher Ensemble
+- 7 independently trained ProCapNet models (default timestamps from 2023-05-29 to 2023-05-30)
+- Location: `models/procap/{cell_type}/strand_merged_umap/{timestamp}.model`
+- Each teacher outputs:
+  - Profile logits: Shape `(batch_size, n_strands, out_window)`
+  - Log counts: Shape `(batch_size, 1)`
+
+### Student Model
+- Based on BPNet architecture (from `BPNet_strand_merged_umap.py`)
+- Default configuration:
+  - Filters: 512
+  - Layers: 8
+  - Input window: 2114 bp
+  - Output window: 1000 bp
+  - Trimming: 557 bp per side
+
+## Training Methodology
+
+Two training approaches are available:
+
+### 1. Streaming Training (`distill_k562.py`)
+Real-time distillation where the student learns directly from teacher predictions generated on-the-fly.
+
+**Advantages:**
+- Memory efficient - no need to pre-generate and store predictions
+- Supports data augmentation (point mutations, structural variations)
+- Dynamic negative sampling with background suppression
+
+**Key Features:**
+- Point mutations: Randomly mutates bases at specified rate (default: 4%)
+- Structural variations: Random insertions/deletions using Poisson rate (default: λ=1.0)
+- Jitter augmentation: Random shifts up to 1024 bp
+- Reverse complement augmentation
+- Negative ratio: 0.125 (1 negative for every 8 positives)
+
+### 2. Batch Training (`train_distilled_student.py`)
+Trains on pre-computed teacher predictions stored in NPZ archives.
+
+**Advantages:**
+- Faster training iterations (no teacher inference overhead)
+- Reproducible training data
+- Easier validation and analysis
+
+**Data Format:**
+NPZ archive containing:
+- `inputs`: DNA sequences (one-hot encoded)
+- `teacher_log_probs`: Normalized log probabilities from ensemble
+- `teacher_log_counts`: Log total counts from ensemble
+- `teacher_profile_counts`: Profile counts (actual tracks)
+
+## Loss Functions
+
+The distillation loss combines two components:
+
+### 1. Profile Loss (MNLL)
+```python
+MNLLLoss(student_log_probs, teacher_profile_counts)
+```
+
+**MNLL**: Multinomial Negative Log-Likelihood  
+Treats teacher profile counts as pseudo-ground-truth and measures how well student predictions match the teacher distribution across positions.
+
+### 2. Count Loss (log1pMSE)
+```python
+log1pMSELoss(student_log_counts, teacher_total_counts)
+```
+
+Mean squared error on `log(1 + x)` transformed counts.  
+Ensures accurate total count predictions.  
+**Default weight:** 0.1  
+
+**Total Loss**
+```python
+total_loss = profile_loss + count_loss_weight * count_loss
+```
 
 ---
 
-### Quick-access Roadmap: Why Are You Here?
+## Usage
 
-**0. I want to make a model prediction or get model importance / contribution scores for my favorite DNA sequence using ProCapNet.**
+### Streaming Training
+```bash
+python src/npp8_files/distill_k562.py \
+  --cell-type K562 \
+  --epochs 100 \
+  --batch-size 64 \
+  --count-loss-weight 0.1 \
+  --bg-suppress-weight 0.1 \
+  --mutation-rate 0.04 \
+  --sv-rate 1.0 \
+  --seed 42 \
+  --output-dir models/distilled_student_streaming
+```
 
-This repository is optimized for reproducing the work in the paper; you might be more interested in using the following stand-alone Colab notebook, which downloads ProCapNet already-trained models from the ENCODE portal and shows how to make predictions or generate scores: https://colab.research.google.com/drive/18H0cUVEksnDKV0STLuemrI1rW7YDj4Gw?usp=sharing 
+**Key Arguments:**
+- `--cell-type`: Cell type to train on (default: K562)
+- `--timestamps`: Teacher model timestamps (uses defaults if not specified)
+- `--epochs`: Number of training epochs (default: 100)
+- `--batch-size`: Training batch size (default: 64)
+- `--count-loss-weight`: Weight for count loss component (default: 0.1)
+- `--bg-suppress-weight`: Weight for background suppression (default: 0.1)
+- `--mutation-rate`: Point mutation rate for augmentation (default: 0.04)
+- `--sv-rate`: Structural variation rate for augmentation (default: 1.0)
 
-**1. I want to download the same dataset(s) you used.**
+### Batch Training
+```bash
+python src/npp8_files/train_distilled_student.py \
+  --archive data/procap/processed/K562/distillation/distillation_dataset_k562.npz \
+  --epochs 5 \
+  --batch-size 64 \
+  --learning-rate 1e-4 \
+  --count-loss-weight 0.1 \
+  --n-filters 512 \
+  --n-layers 8 \
+  --output-dir models/distilled_student
+```
 
-See `src/0_download_files/0.1_download_data.sh` -- this script shows how most data files were downloaded from the ENCODE portal, including the PRO-cap experiments, DNase peaks, candidate cis-regulatory element annotations, and RAMPAGE experiments, in all cell types used in the paper. For the chromatin accessibility and histone modification datasets used in the cross-cell-type analysis, see `src/0_download_files/0.2_download_histone_marks.sh`. For ENCODE accession IDs for each experiment, see the Supplemental Table in the manuscript.
-
-**2. I want to know how you processed the model training data.**
-
-PRO-cap data itself was processed from BAMs to bigWigs using this script: `src/1_process_data/1.0_process_bams.sh`.
-
-Model training used both PRO-cap peaks ("positive" examples) and DNase peaks not overlapping PRO-cap peaks ("negative" examples). These two sets of loci were processed using the scripts `src/1_process_data/1.1_process_peaks.sh` and `src/1_process_data/1.2_process_dnase_peaks.sh`, respectively. The second script relies on outputs from the first.
-
-**3. I want to know the exact model architecture you used.**
-
-See `src/2_train_models/BPNet_strand_merged_umap.py` for the model architecture and training loop. All model training and evaluation is implemented in PyTorch and largely adapted from Jacob Schreiber's `bpnet-lite` repository (https://github.com/jmschrei/bpnet-lite). If you are looking for any implementation of BPNet, rather than ProCapNet specifically, check out `bpnet-lite` instead. The ProCapNet implementation is modified from `bpnet-lite` in two main ways: 1) while the model makes two-stranded predictions, the loss functions are effectively applied jointly across the two strands; and 2) ProCapNet uses mappability-aware training, where the model is not penalized for mispredictions on bases that are not uniquely mappable by sequencing reads. See the Methods section of the paper for further details.
-
-Model hyperparameters are stored in `2_train_models/hyperparams.py`.
-
-**4. I want to see how final model predictions or importance scores / contribution scores / DeepSHAP scores / sequence attributions were generated.**
-
-See the scripts in `src/3_eval_models`, particularly `src/3_eval_models/eval_utils.py`, for the former.
-
-See the scripts in `src/4_interpret_models`, particularly the `get_attributions()` function in `src/4_interpret_models/deepshap_utils.py`, for the latter.
-
-**5. I want to know how you identified motifs from contribution scores.**
-
-Motif identification consists of two steps: 1) running TF-MoDISco, and 2) calling instances of the motif patterns found by TF-MoDISco.
-
-We ran TF-MoDISco using tf-modiscolite, the sped-up and cleaned-up implementation by Jacob Schreiber (https://github.com/jmschrei/tfmodisco-lite, soon to be moved to the official TF-MoDISco repository). See the function `_run_modisco()` in the file `src/5_modisco/modiscolite_utils.py` for the parameters and inputs used.
-
-Motif instance calling was performed using the following script: `src/6_call_motifs/call_motifs_script.py` Thresholds in that script were tuned manually to minimize false-positive and false-negative rates.
-
-**6. I want to see how a specific model evaluation, analysis, or other result in the paper was produced.**
-
-See `src/figure_notebooks/`. Each figure and table in the paper has an associated jupyter notebook (the analyses for some supplementary figures and tables are contained within the main figure's notebook). The notebooks contain all the code to go from the outputs of the folders numbered 1-6 in `src/` (model prediction, contribution scoring, motif calling) to the plots in the figures themselves.
-
-**7. I want to train or interpret my own ProCapNet model on a dataset of my own; also, I am having trouble running the code as-is and want a streamlined version.**
-
-See `src/standalone_scripts/`. All you need to do is change the filepaths at the top of the script to point to your data and desired results save paths.
-
-**8. I want to re-run your entire workflow, as it was run for the manuscript.**
-
-See below!
+**Key Arguments:**
+- `--archive`: Path to distillation NPZ archive
+- `--val-fraction`: Fraction of data for validation (default: 0.1)
+- `--train-limit`: Optional cap on training samples
+- `--val-limit`: Optional cap on validation samples
+- `--n-filters`: Number of convolutional filters (default: 512)
+- `--n-layers`: Number of convolutional layers (default: 8)
+- `--experiment-npz`: Optional NPZ with experimental profiles for validation
+- `--eval-base-only`: Restrict validation to non-augmented examples
 
 ---
 
-## Running Everything From Scratch
+## Data Requirements
 
-The script `run_everything.sh` exists as a roadmap of what order to run all of the code in. I would probably not literally run this script, because that would take weeks on a good GPU; instead I would recommend running the commands inside it one-by-one.
+**Input Data**
+- Genome: `genomes/hg38.withrDNA.fasta`
+- Peaks: `data/procap/processed/{cell_type}/peaks.bed.gz`
+- Negatives: `data/procap/processed/{cell_type}/dnase_peaks_no_procap_overlap.bed.gz`
+- Teacher Models: Pre-trained models in `models/procap/{cell_type}/strand_merged_umap/`
 
-### Installation & Setup
-
-First, make a directory for everything to happen in, and move into that directory. Then download this repository and move inside it.
-
-```
-mkdir -p "/users/me/procapnet"
-cd "/users/me/procapnet"
-git clone http://git@github.com/kundajelab/ProCapNet.git
-cd ProCapNEt
-```
-
-The script `setup_project_directory.sh` will build the directory structure for all the raw + processed data, all the models saved after training, and all model outputs.
-
-You will also probably want to set up a conda environment or similar way of having all the correct Python packages. See `conda_env_spec_file.txt` for every package and version used to run everything.
-
-### From Downloading Data to Calling Motifs
-
-From here on out, every step consists of just running the script `runall.sh` inside of each of the folders in `src/` numbered 1 through 6.
-
-For example, to populate your new data directory with data, and then process that data, you would run these scripts:
-```
-./src/0_download_files/0_runall.sh
-./src/1_process_data/1_runall.sh
-```
-Note that in some cases, there are additional *optional* `runall.sh` scripts, which are for if you are looking to reproduce a specific, singular result far downstream of training models. For instance, `./src/1_process_data/1_runall.sh` processes all the data you need to train a model, get contribution scores and motifs, etc., while `./src/1_process_data/1_runall_optional_annotations.sh` will also process all the extra data needed to run the model evaluations stratified by various region classifications from Figure 1 of the paper. These optional scripts are also included in `run_everything.sh`, but you can skip running them if you don't need to produce the results that depend on them.
-
-Note #2: model training, prediction, and contribution score generation are expecting to be run on a GPU, and the `runall.sh` scripts for those steps expect an input argument specifying the ID of the GPU to use. If you're not sure what GPU ID to use, 0 is a good guess. 
-
-Note #3: trained models are saved using unique identifiers -- namely, timestamp strings. To point the model prediction and contribution score scripts at the correct models, you will need to supply the timestamps of the models you trained. So for example, in `src/3_eval_models/3_runall.sh`, you would edit this line:
-```
-timestamps=( "2023-05-29_15-51-40" "2023-05-29_15-58-41" "2023-05-29_15-59-09" "2023-05-30_01-40-06" "2023-05-29_23-21-23" "2023-05-29_23-23-45" "2023-05-29_23-24-11" )
-```
-### Re-Creating Plots, Figures, Tables, and Stats
-
-Any jupyter notebook in `src/figure_notebooks/` can be run once you have run the scripts in folders 1-6. They require the same conda environment as the scripts -- the package `nb_conda_kernels` was used for running notebooks inside conda environments. The notebooks show plots inside the notebooks themselves, but also save every plot to the `figures/` folder in high resolution.
-
-Note that you may need to point notebooks to the correct GPU and correct model timestamps in the same way as with earlier scripts, but in the case of the notebooks, you'll need to edit the info directly in the first few cells of each notebook.
-
-That's it!
+**Data Preparation**
+The `DistillerPeakGenerator` handles:
+- Peak sampling with jitter augmentation
+- Negative sampling from DNase peaks
+- One-hot encoding of sequences
+- Reverse complement augmentation
+- Dynamic batch generation
 
 ---
 
-### Code credits:
-- Jacob Schreiber (@jmschrei)'s bpnetlite, tf-modiscolite, and tangermeme repositories are the backbone of this repository
-- Alex Tseng (@amtseng)'s code for model training and evaluation in PyTorch is incorporated into bpnet-lite
-- Otherwise code is authored by Kelly Cochran (@kellycochran)
+## Output Files
 
-### Repositories this project uses
-- https://github.com/jmschrei/bpnet-lite
-- https://github.com/jmschrei/tfmodisco-lite
-- https://github.com/jmschrei/tangermeme
+Training produces:
+- **Student Model:** `student_best.pt` (best validation checkpoint)
+- **Final Model:** `student_last.pt` (final epoch checkpoint)
+- **Training Metrics:** `training_metrics.jsonl` (per-epoch metrics)
 
+**Metrics logged per epoch:**
+- `train_prob`: Training profile loss (MNLL)
+- `train_count`: Training count loss (log1pMSE)
+- `val_prob`: Validation profile loss
+- `val_count`: Validation count loss
+- `val_total`: Combined validation loss
 
-## Primary Dependencies
-- Python ~ 3.9
-- Pytorch (GPU version) v1.12 (py3.9_cuda11.6_cudnn8.3.2_0)
-- numpy v1.22
-- pybigwig v0.3.18
-- pyfaidx v0.7
-- Captum v0.5 (for deepshap)
-- modisco-lite v2.0.0
-- bedtools v2.30
-- scikit-learn v1.1.2
-- scipy v1.10
-- pandas v1.4.3
-- h5py v3.7
-- meme v5.4.1
-- statsmodels v0.13.2
-- logomaker v0.8
-- matplotlib v3.5.2
-- jupyter_core v4.10, IPython v 8.4, and nb_conda_kernels v2.3.1
+Optional experimental metrics (if `--experiment-npz` provided):
+- `exp_profile_pearson_mean/median`: Profile Pearson correlation
+- `exp_count_pearson_mean/median`: Count Pearson correlation
+- `exp_count_log1pMSE_mean/median`: Count prediction error
 
-## LICENSE
+---
 
-This project is covered under the MIT License.
+## Key Implementation Details
 
-Copyright (c) 2023 Kundaje Lab
+### Ensemble Averaging
+Teachers are averaged at the profile count level (not probability level):
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+```python
+# For each teacher:
+profile_counts = probabilities * total_counts
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+# Average across ensemble:
+avg_profile_counts = mean(teacher_profile_counts)
+avg_total_counts = mean(teacher_total_counts)
+```
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+This approach maintains consistency between profile and count predictions.
+
+### Label-Guided Training
+Optional background suppression using binary labels:
+
+- `labels == 1`: PRO-cap peaks (compute full loss)
+- `labels == 0`: DNase peaks with no PRO-cap signal (optional background suppression)
+
+When background suppression is enabled, profile loss is computed only on positive examples.
+
+---
+
+## Optimization
+
+- Optimizer: **Adam**
+- Learning Rate: `1e-4` (default)
+- Gradient Management: `set_to_none=True` for memory efficiency
+- Device: Automatically uses CUDA if available
+
+---
+
+## Performance Considerations
+
+**Memory Usage**
+- Streaming: Lower memory footprint, slower per-epoch
+- Batch: Higher memory (loads NPZ), faster per-epoch
+
+**Training Speed**
+- Streaming: ~10–15 minutes per epoch (GPU-dependent)
+- Batch: ~5–8 minutes per epoch (GPU-dependent)
+
+---
+
+## Recommended Settings
+
+**For best quality:**
+- Streaming with augmentation
+- 100+ epochs
+- `mutation_rate=0.04`, `sv_rate=1.0`
+
+**For fast prototyping:**
+- Batch training
+- 5–10 epochs
+- Smaller validation set with `--val-limit`
