@@ -245,11 +245,11 @@ def _distillation_loss(
     if labels is not None:
         # Only compute loss on peaks (labels == 1)
         profile_loss = MNLLLoss(student_log_probs[labels == 1], teacher_counts_flat[labels == 1]).mean()
+        # Also only compute count loss on peaks to ensure consistent gradient signals
+        count_loss = log1pMSELoss(student_log_counts[labels == 1], torch.exp(teacher_log_counts[labels == 1]) - 1.0).mean()
     else:
         profile_loss = MNLLLoss(student_log_probs, teacher_counts_flat).mean()
-    
-    # Calculate count loss
-    count_loss = log1pMSELoss(student_log_counts, torch.exp(teacher_log_counts) - 1.0).mean()
+        count_loss = log1pMSELoss(student_log_counts, torch.exp(teacher_log_counts) - 1.0).mean()
     
     # Extract values for logging
     profile_loss_val = profile_loss.item()
