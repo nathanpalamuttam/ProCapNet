@@ -258,7 +258,7 @@ class DistillerPeakNegativeSampler(torch.utils.data.Dataset):
 
         if self.random_state.uniform() >= self.negative_likelihood:
             idx = self.peak_ordering[self.n_peaks_seen % self.n_peaks]
-            jitter = self.random_state.randint(self.max_jitter * 2)
+            jitter = 0 if self.max_jitter <= 0 else self.random_state.randint(self.max_jitter * 2)
             label = 1
 
             X, X_ctl = self.peak_sequences, self.peak_controls
@@ -618,13 +618,6 @@ def DistillerPeakGenerator(
             The maximum number of counts, summed across the length of each example
             and across all tasks, needed to be kept. If None, no maximum. Default
             is None.
-
-    summits: bool, optional
-            Whether to return a region centered around the summit instead of the center
-            between the start and end. If True, it will add the 10th column (index 9)
-            to the start to get the center of the window, and so the data must be in
-            narrowPeak format.
-
     exclusion_lists: list or None, optional
             A list of strings of filenames to BED-formatted files containing exclusion
             lists, i.e., regions where overlapping loci should be filtered out. If None,
@@ -656,6 +649,10 @@ def DistillerPeakGenerator(
     # Wrapper to tolerate tangermeme.extract_loci signature differences
     def _safe_extract_loci(loci, max_j, ret_mask=True):
         try:
+            # Call with a conservative argument set; leave out optional kwargs
+            # (exclusion_lists, min/max_counts, return_mask) that older
+            # extract_loci implementations may not support. The ret_mask arg is
+            # accepted by the wrapper for API parity but is intentionally unused.
             return extract_loci(
                 loci=loci,
                 sequences=sequences,
