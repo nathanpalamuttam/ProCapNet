@@ -1,16 +1,14 @@
 """Utilities for K562 distillation.
 
-Adds a streaming mode that trains a student directly from
-DistillerPeakGenerator batches while matching a teacher ensemble and
-optionally using binary labels (peak/background) to suppress background.
+Streaming mode that trains a student directly from DistillerPeakGenerator
+batches while matching a teacher ensemble, using Model.fit_generator for training.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple, Optional
+from typing import Iterable, Iterator, List, Sequence, Tuple, Optional
 
 import numpy as np
 import torch
@@ -21,7 +19,9 @@ utils_src = proj_root / "src" / "utils"
 npp8_src = proj_root / "src" / "npp8_files"
 
 import sys
-for p in (train_src, utils_src, npp8_src):
+if str(train_src) not in sys.path:
+    sys.path.insert(0, str(train_src))
+for p in (utils_src, npp8_src):
     ps = str(p)
     if ps not in sys.path:
         sys.path.append(ps)
@@ -29,8 +29,6 @@ for p in (train_src, utils_src, npp8_src):
 from BPNet_strand_merged_umap import Model  # type: ignore  # noqa: E402
 from data_loader import DistillerPeakGenerator  # type: ignore  # noqa: E402
 from misc import ensure_parent_dir_exists  # type: ignore  # noqa: E402
-from losses import MNLLLoss, log1pMSELoss  # type: ignore  # noqa: E402
-
 
 
 DEFAULT_TIMESTAMPS = (
@@ -44,7 +42,8 @@ DEFAULT_TIMESTAMPS = (
 )
 
 
-def _load_teacher_models(timestamps: Sequence[str], cell_type: str, device: torch.device) -> List[Model]:
+def _load_teacher_models(timestamps: Sequence[str], cell_type: str) -> List[Model]:
+    """Load teacher models and keep them on CPU to save GPU memory."""
     models: List[Model] = []
     model_dir = proj_root / "models" / "procap" / cell_type / "strand_merged_umap"
     if not model_dir.exists():
@@ -55,73 +54,11 @@ def _load_teacher_models(timestamps: Sequence[str], cell_type: str, device: torc
         if not model_path.exists():
             raise FileNotFoundError(f"Missing teacher checkpoint: {model_path}")
 
-        model: Model = torch.load(model_path, map_location=device, weights_only = False)
-        model = model.to(device)
+        model: Model = torch.load(model_path, map_location="cpu", weights_only=False)
         model.eval()
-        models.append(model)
+        models.append(model)  # Keep on CPU
 
     return models
-
-
-def _predict_ensemble(
-    models: Sequence[Model],
-    inputs: np.ndarray,
-    device: torch.device,
-    batch_size: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ensemble-averaged log probs, log counts, and profile counts."""
-
-    if inputs.dtype != np.float32:
-        inputs = inputs.astype(np.float32, copy=False)
-
-    n_examples = inputs.shape[0]
-    n_strands = models[0].n_outputs
-    out_window = models[0].trimming * -2 + inputs.shape[-1]
-
-    log_prob_out = np.empty((n_examples, n_strands, out_window), dtype=np.float32)
-    log_count_out = np.empty((n_examples, 1), dtype=np.float32)
-    profile_counts_out = np.empty((n_examples, n_strands, out_window), dtype=np.float32)
-
-    log_softmax = torch.nn.LogSoftmax(dim=-1)
-
-    for start in range(0, n_examples, batch_size):
-        end = min(start + batch_size, n_examples)
-        batch = torch.from_numpy(inputs[start:end]).to(device)
-
-        track_accum = None
-
-        for model in models:
-            with torch.no_grad():
-                y_profile, y_counts = model(batch)
-                flat = y_profile.reshape(y_profile.shape[0], -1)
-                log_probs = log_softmax(flat).reshape_as(y_profile)
-            
-            log_probs_np = log_probs.detach().cpu().numpy()
-            log_counts_np = y_counts.detach().cpu().numpy()
-            
-            probs_np = np.exp(log_probs_np).astype(np.float32, copy=False)
-            total_counts_np = np.exp(log_counts_np).astype(np.float32, copy=False) - 1.0
-            track_np = probs_np * total_counts_np.reshape(-1, 1, 1)
-
-            if track_accum is None:
-                track_accum = track_np
-            else:
-                track_accum += track_np
-
-        # Average the tracks
-        track_avg = track_accum / float(len(models))
-
-        # Derive total_counts from averaged track
-        total_counts_avg = track_avg.reshape(track_avg.shape[0], -1).sum(axis=1, keepdims=True) + 1.0
-
-        # Derive probabilities from averaged track and total_counts
-        prob_avg = track_avg / np.clip(total_counts_avg.reshape(-1, 1, 1) - 1.0, 1e-12, None)
-
-        log_prob_out[start:end] = np.log(np.clip(prob_avg, 1e-12, None)).astype(np.float32, copy=False)
-        log_count_out[start:end] = np.log(np.clip(total_counts_avg, 1e-12, None)).astype(np.float32, copy=False)
-        profile_counts_out[start:end] = track_avg.astype(np.float32, copy=False)
-
-    return log_prob_out, log_count_out, profile_counts_out
 
 
 def _make_streaming_loader(
@@ -129,9 +66,11 @@ def _make_streaming_loader(
     in_window: int = 2114,
     out_window: int = 1000,
     batch_size: int = 64,
-    negative_ratio: float = 0.125,
-    max_jitter: int = 1024,
-    reverse_complement: bool = True,
+    negative_ratio: float = 0.1,
+    max_jitter: int = 0,
+    reverse_complement: bool = False,
+    mutation_rate: float = 0.0,
+    sv_rate: float = 0.0,
     seed: int = 42,
     verbose: bool = True,
 ):
@@ -153,6 +92,8 @@ def _make_streaming_loader(
         max_jitter=max_jitter,
         negative_ratio=negative_ratio,
         reverse_complement=reverse_complement,
+        mutation_rate=mutation_rate,
+        sv_rate=sv_rate,
         shuffle=True,
         random_state=seed,
         pin_memory=torch.cuda.is_available(),
@@ -167,98 +108,137 @@ def _make_streaming_loader(
 def _teacher_batch(
     models: Sequence[Model], X: torch.Tensor, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return (teacher_log_probs, teacher_log_counts) as torch tensors on device."""
+    """Return (teacher_profile_counts, teacher_log_counts) as torch tensors on device.
+    
+    Teachers are moved to GPU one at a time to save memory.
+    """
     log_softmax = torch.nn.LogSoftmax(dim=-1)
-    prob_accum: Optional[torch.Tensor] = None
-    total_accum: Optional[torch.Tensor] = None
+    track_accum: Optional[torch.Tensor] = None
 
     for m in models:
+        # Move teacher to GPU for inference
+        m = m.to(device)
         m.eval()
+        
         logits, log_counts = m(X)
         flat = logits.reshape(logits.shape[0], -1)
         log_probs = log_softmax(flat).reshape_as(logits)
         probs = torch.exp(log_probs)
         total = torch.exp(log_counts) - 1.0
-        
-        if prob_accum is None:
-            prob_accum = probs
-            total_accum = total
+
+        # Track = probabilities * total counts per example
+        track = probs * total.view(-1, 1, 1)
+
+        if track_accum is None:
+            track_accum = track.clone()
         else:
-            prob_accum = prob_accum + probs
-            total_accum = total_accum + total
+            track_accum = track_accum + track
 
-    assert prob_accum is not None and total_accum is not None
-    
-    # Average the profiles and counts separately
-    prob_avg = prob_accum / float(len(models))
-    total_avg = total_accum / float(len(models))
-    
-    # Compute the track (profile counts) from averaged quantities
-    profile_counts = prob_avg * total_avg.view(-1, 1, 1)
-    
-    teacher_log_counts = torch.log(torch.clamp(total_avg + 1.0, min=1e-12))
-    return profile_counts, teacher_log_counts
+        # Move teacher back to CPU and free GPU memory
+        m.cpu()
+        del logits, log_counts, flat, log_probs, probs, total, track
+        torch.cuda.empty_cache()
+
+    assert track_accum is not None
+
+    # Average tracks directly (E[P*C]), then derive totals and log counts
+    track_avg = track_accum / float(len(models))
+    total_avg = track_avg.reshape(track_avg.shape[0], -1).sum(dim=1, keepdim=True) + 1.0
+
+    teacher_log_counts = torch.log(torch.clamp(total_avg, min=1e-12))
+    return track_avg, teacher_log_counts
 
 
-def _distillation_loss(
-    student_logits: torch.Tensor,
-    student_log_counts: torch.Tensor,
-    teacher_profile_counts: torch.Tensor,
-    teacher_log_counts: torch.Tensor,
-    count_loss_weight: float,
-    labels: torch.Tensor
-) -> Tuple[float, float, torch.Tensor]:
-    """Compute distillation loss using mixture loss on teacher profile counts.
+class TeacherDistillationGenerator:
+    """Wrap a base loader to attach teacher targets and masks for fit_generator.
     
-    Parameters
-    ----------
-    student_logits: torch.Tensor
-        Student model logits (unnormalized)
-    student_log_counts: torch.Tensor
-        Student model log counts
-    teacher_profile_counts: torch.Tensor
-        Teacher ensemble profile counts (treated as "ground truth" y)
-    teacher_log_counts: torch.Tensor
-        Teacher ensemble log counts
-    count_loss_weight: float
-        Weight for count loss
-    labels: torch.Tensor, optional
-        Binary labels (1=peak, 0=background) for label-guided training
-        
-    Returns
-    -------
-    profile_loss: float
-        Profile loss value (for logging)
-    count_loss: float
-        Count loss value (for logging)
-    total_loss: torch.Tensor
-        Combined loss for backpropagation
+    Yields (X, y, mask) tuples where:
+    - X: input sequences (batch_size, 4, in_window)
+    - y: teacher profile counts (batch_size, n_outputs, out_window)
+    - mask: boolean mask for valid positions (batch_size, n_outputs, out_window)
+    
+    This matches the format expected by Model.fit_generator from BPNet_strand_merged_umap.
     """
-    # Flatten and normalize student logits
-    student_logits_flat = student_logits.reshape(student_logits.shape[0], -1)
-    student_log_probs = torch.nn.functional.log_softmax(student_logits_flat, dim=-1)
+
+    def __init__(self, loader: Iterable, teachers: Sequence[Model], device: torch.device) -> None:
+        self.loader = loader
+        self.teachers = teachers
+        self.device = device
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        for batch in self.loader:
+            if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                X_cpu, _label = batch
+            else:
+                X_cpu, _Xctl, _label = batch
+
+            X_cpu = X_cpu.to(dtype=torch.float32)
+            X_device = X_cpu.to(self.device, non_blocking=True)
+
+            with torch.no_grad():
+                teacher_profile_counts, _teacher_log_counts = _teacher_batch(
+                    self.teachers, X_device, self.device
+                )
+
+            # Round to integer counts like file 2 does
+            teacher_profile_counts = torch.round(teacher_profile_counts)
+            
+            # Ensure non-zero total counts (fit_generator requires this for MNLL)
+            totals = teacher_profile_counts.reshape(teacher_profile_counts.shape[0], -1).sum(dim=1)
+            zero_mask = totals == 0
+            if zero_mask.any():
+                # Add a small count to first position for zero-sum examples
+                teacher_profile_counts[zero_mask, 0, 0] = 1.0
+
+            teacher_profile_counts = teacher_profile_counts.cpu()
+            mask = torch.ones_like(teacher_profile_counts, dtype=torch.bool)
+
+            yield X_cpu, teacher_profile_counts, mask
+
+
+def _build_validation_arrays(
+    loader: Iterable,
+    teachers: Sequence[Model],
+    device: torch.device,
+    n_batches: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build validation arrays from streaming loader.
     
-    # Flatten teacher profile counts (these are our "y" - the pseudo ground truth)
-    teacher_counts_flat = teacher_profile_counts.reshape(teacher_profile_counts.shape[0], -1)
+    Returns (X_valid, y_valid) as numpy arrays.
+    """
+    X_list, y_list = [], []
     
-    # Calculate profile loss using MNLL
-    if labels is not None:
-        # Only compute loss on peaks (labels == 1)
-        profile_loss = MNLLLoss(student_log_probs[labels == 1], teacher_counts_flat[labels == 1]).mean()
-        # Also only compute count loss on peaks to ensure consistent gradient signals
-        count_loss = log1pMSELoss(student_log_counts[labels == 1], torch.exp(teacher_log_counts[labels == 1]) - 1.0).mean()
-    else:
-        profile_loss = MNLLLoss(student_log_probs, teacher_counts_flat).mean()
-        count_loss = log1pMSELoss(student_log_counts, torch.exp(teacher_log_counts) - 1.0).mean()
+    for i, batch in enumerate(loader):
+        if i >= n_batches:
+            break
+            
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            X_cpu, _label = batch
+        else:
+            X_cpu, _Xctl, _label = batch
+
+        X_cpu = X_cpu.to(dtype=torch.float32)
+        X_device = X_cpu.to(device, non_blocking=True)
+
+        with torch.no_grad():
+            teacher_profile_counts, _ = _teacher_batch(teachers, X_device, device)
+
+        # Round to integer counts
+        teacher_profile_counts = torch.round(teacher_profile_counts)
+        
+        # Ensure non-zero totals
+        totals = teacher_profile_counts.reshape(teacher_profile_counts.shape[0], -1).sum(dim=1)
+        zero_mask = totals == 0
+        if zero_mask.any():
+            teacher_profile_counts[zero_mask, 0, 0] = 1.0
+
+        X_list.append(X_cpu.numpy())
+        y_list.append(teacher_profile_counts.cpu().numpy())
+
+    X_valid = np.concatenate(X_list, axis=0).astype(np.float32)
+    y_valid = np.concatenate(y_list, axis=0).astype(np.float32)
     
-    # Extract values for logging
-    profile_loss_val = profile_loss.item()
-    count_loss_val = count_loss.item()
-    
-    # Mix losses together
-    total_loss = profile_loss + count_loss_weight * count_loss
-    
-    return profile_loss_val, count_loss_val, total_loss
+    return X_valid, y_valid
 
 
 def run_streaming_training(
@@ -266,138 +246,164 @@ def run_streaming_training(
     timestamps: Sequence[str] = (),
     epochs: int = 100,
     batch_size: int = 64,
-    learning_rate: float = 1e-4,
-    count_loss_weight: float = 0.1,
-    bg_suppress_weight: float = 0.1,
+    learning_rate: float = 1e-3,
+    alpha: float = 1.0,
     mutation_rate: float = 0.04,
     sv_rate: float = 1.0,
     seed: int = 42,
+    validation_iter: int = 100,
+    early_stop_epochs: int = 10,
+    n_val_batches: int = 10,
+    verbose: bool = True,
+    metrics_path: Optional[Path] = None,
     out_dir: Optional[Path] = None,
 ):
+    """Train student model using streaming data from DistillerPeakGenerator.
+    
+    Parameters
+    ----------
+    cell_type : str
+        Cell type for data loading (e.g., "K562")
+    timestamps : Sequence[str]
+        Teacher model timestamps
+    epochs : int
+        Maximum number of training epochs
+    batch_size : int
+        Batch size for training
+    learning_rate : float
+        Learning rate for optimizer
+    alpha : float
+        Weight for count loss term (total_loss = mnll + alpha * mse)
+    mutation_rate : float
+        Point mutation rate for augmentation
+    sv_rate : float
+        Structural variation rate (Poisson lambda)
+    seed : int
+        Random seed
+    validation_iter : int
+        Validate every N iterations
+    early_stop_epochs : int
+        Stop if no improvement for this many epochs
+    n_val_batches : int
+        Number of batches to use for validation set
+    verbose : bool
+        Enable per-epoch logging
+    metrics_path : Path, optional
+        Path to write training metrics TSV
+    out_dir : Path, optional
+        Output directory for model checkpoints
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    out_dir = out_dir or (proj_root / "models" / "distilled_student_streaming")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # Student model
     trimming = (2114 - 1000) // 2
+    model_save_path = out_dir / "student.model"
+    
     student = Model(
-        model_save_path=str((out_dir or proj_root / "models" / "distilled_student_streaming") / "student_v2.model"),
+        model_save_path=str(model_save_path),
         n_filters=512,
         n_layers=8,
+        n_outputs=2,
+        alpha=alpha,
         trimming=trimming,
     ).to(device)
 
-    # Teachers
+    # Teachers (kept on CPU, moved to GPU one at a time during inference)
     if not timestamps:
         timestamps = tuple(DEFAULT_TIMESTAMPS)
-    teachers = _load_teacher_models(timestamps, cell_type, device)
+    teachers = _load_teacher_models(timestamps, cell_type)
 
-    # Data
-    loader = _make_streaming_loader(
+    # Training data loader
+    train_loader = _make_streaming_loader(
         cell_type=cell_type,
         batch_size=batch_size,
         negative_ratio=0.125,
         max_jitter=1024,
         reverse_complement=True,
+        mutation_rate=mutation_rate,
+        sv_rate=sv_rate,
         seed=seed,
-        verbose=True,
+        verbose=verbose,
     )
 
-    opt = torch.optim.Adam(student.parameters(), lr=learning_rate)
+    # Validation data loader (no augmentation for consistency)
+    val_loader = _make_streaming_loader(
+        cell_type=cell_type,
+        batch_size=batch_size,
+        negative_ratio=0.125,
+        max_jitter=0,
+        reverse_complement=False,
+        mutation_rate=0.0,
+        sv_rate=0.0,
+        seed=seed + 1,
+        verbose=False,
+    )
 
-    history: List[dict] = []
-    for epoch in range(1, epochs + 1):
-        student.train()
-        epoch_prob, epoch_count, epoch_bg = [], [], []
-        for batch in loader:
-            if isinstance(batch, (list, tuple)) and len(batch) == 2:
-                X, y = batch
-            else:
-                X, _Xctl, y = batch  # controls path
+    # Build validation arrays
+    print(f"Building validation set ({n_val_batches} batches)...")
+    X_valid, y_valid = _build_validation_arrays(val_loader, teachers, device, n_val_batches)
+    print(f"Validation set: {X_valid.shape[0]} examples")
 
-            X = X.to(device, dtype=torch.float32, non_blocking=True)
-            y = y.to(device)
+    # Wrap training loader with teacher distillation
+    training_data = TeacherDistillationGenerator(train_loader, teachers, device)
 
-            # Get teacher predictions (profile counts, not log probs)
-            with torch.no_grad():
-                teacher_profile_counts, teacher_log_counts = _teacher_batch(teachers, X, device)
+    optimizer = torch.optim.Adam(student.parameters(), lr=learning_rate)
 
-            # Get student predictions
-            student_logits, student_log_counts = student(X)
+    ensure_parent_dir_exists(str(model_save_path))
+    
+    if verbose:
+        arch_txt = model_save_path.with_suffix(".arch.txt")
+        student.save_model_arch_to_txt(str(arch_txt))
 
-            # Compute distillation loss using mixture loss
-            profile_loss_val, count_loss_val, kd_loss = _distillation_loss(
-                student_logits=student_logits,
-                student_log_counts=student_log_counts,
-                teacher_profile_counts=teacher_profile_counts,
-                teacher_log_counts=teacher_log_counts,
-                count_loss_weight=count_loss_weight,
-                labels = y
-            )
-            opt.zero_grad(set_to_none=True)
-            kd_loss.backward()
-            opt.step()
+    # Train using fit_generator (handles MNLL + MSE loss logging internally)
+    student.fit_generator(
+        training_data=training_data,
+        optimizer=optimizer,
+        X_valid=X_valid,
+        y_valid=y_valid,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        validation_iter=validation_iter,
+        early_stop_epochs=early_stop_epochs,
+        verbose=verbose,
+        save=True,
+    )
 
-            epoch_prob.append(profile_loss_val)
-            epoch_count.append(count_loss_val)
+    # Save metrics to custom path if specified
+    if metrics_path and student.train_metrics:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w") as handle:
+            for line in student.train_metrics:
+                handle.write(line + "\n")
+        print(f"Saved metrics to {metrics_path}")
 
-        rec = {
-            "epoch": epoch,
-            "train_prob": float(np.mean(epoch_prob) if epoch_prob else 0.0),
-            "train_count": float(np.mean(epoch_count) if epoch_count else 0.0),
-        }
-        if bg_suppress_weight > 0:
-            rec["train_bg"] = float(torch.stack(epoch_bg).mean().item() if epoch_bg else 0.0)
-            print(
-                f"Epoch {epoch:02d}: MNLL(profile)={rec['train_prob']:.4f} "
-                f"log1pMSE(count)={rec['train_count']:.4f} BG={rec['train_bg']:.4f}"
-            )
-        else:
-            print(
-                f"Epoch {epoch:02d}: MNLL(profile)={rec['train_prob']:.4f} "
-                f"log1pMSE(count)={rec['train_count']:.4f}"
-            )
-        history.append(rec)
+    # Save additional checkpoint formats
+    torch.save({"epoch": epochs, "model": student.state_dict()}, out_dir / "student_final.pt")
+    print(f"Saved student to {out_dir}")
 
-    # Save student
-    out_dir = out_dir or (proj_root / "models" / "distilled_student_streaming")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({"epoch": epochs, "model": student.state_dict()}, out_dir / "student_best.pt")
-    with (out_dir / "training_metrics.jsonl").open("w") as handle:
-        import json
-        for row in history:
-            handle.write(json.dumps(row) + "\n")
-    print(f"Saved streaming student to {out_dir}")
-
-def _stack_batches(batches: Iterable[np.ndarray]) -> np.ndarray:
-    arrays = list(batches)
-    if not arrays:
-        raise ValueError("No arrays to stack")
-    return np.concatenate(arrays, axis=0)
-
-
-def _write_metadata(metadata_path: Path, metadata: dict) -> None:
-    ensure_parent_dir_exists(str(metadata_path))
-    with metadata_path.open("w") as handle:
-        json.dump(metadata, handle, indent=2)
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Prepare K562 distillation dataset")
+    parser = argparse.ArgumentParser(description="K562 streaming distillation training")
     parser.add_argument("--cell-type", default="K562")
-    parser.add_argument("--timestamps", nargs="*", default=DEFAULT_TIMESTAMPS)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--device", default=None, help="torch device string")
-    parser.add_argument("--num-augmentations", type=int, default=1)
-    parser.add_argument("--shift-range", type=int, default=1024)
-    parser.add_argument("--rc-prob", type=float, default=0.5)
-    parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--stream", action="store_true", help="Run streaming KD training instead of building NPZ")
+    parser.add_argument("--timestamps", nargs="*", default=None)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--count-loss-weight", type=float, default=0.1)
-    parser.add_argument("--bg-suppress-weight", type=float, default=0.1)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--alpha", type=float, default=1.0, help="Weight for count loss term")
+    parser.add_argument("--validation-iter", type=int, default=100, help="Validate every N iterations")
+    parser.add_argument("--early-stop-epochs", type=int, default=10)
+    parser.add_argument("--n-val-batches", type=int, default=10, help="Number of batches for validation set")
     parser.add_argument("--mutation-rate", type=float, default=0.04, help="Point mutation rate for augmentation")
     parser.add_argument("--sv-rate", type=float, default=1.0, help="Structural variation rate (Poisson lambda)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--metrics-path", type=Path, default=None, help="Path to write training metrics (tsv)")
+    parser.add_argument("--quiet", action="store_true", help="Disable verbose training logs")
     return parser
 
 
@@ -405,22 +411,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_argparser()
     args = parser.parse_args(argv)
 
-    device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = Path(args.output_dir) if args.output_dir else None
     run_streaming_training(
         cell_type=args.cell_type,
-        timestamps=args.timestamps or tuple(DEFAULT_TIMESTAMPS),
+        timestamps=tuple(args.timestamps) if args.timestamps else tuple(DEFAULT_TIMESTAMPS),
         epochs=max(1, args.epochs),
         batch_size=args.batch_size,
-        learning_rate=1e-4,
-        count_loss_weight=args.count_loss_weight,
-        bg_suppress_weight=args.bg_suppress_weight,
+        learning_rate=args.learning_rate,
+        alpha=args.alpha,
         mutation_rate=args.mutation_rate,
         sv_rate=args.sv_rate,
         seed=args.seed,
-        out_dir=out_dir,
+        validation_iter=args.validation_iter,
+        early_stop_epochs=args.early_stop_epochs,
+        n_val_batches=args.n_val_batches,
+        verbose=not args.quiet,
+        metrics_path=args.metrics_path,
+        out_dir=args.output_dir,
     )
-    
 
 
 if __name__ == "__main__":
